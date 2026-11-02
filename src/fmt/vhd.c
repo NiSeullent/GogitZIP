@@ -7,7 +7,9 @@
  *   differencing  like dynamic; sectors whose bitmap bit is clear (and
  *                 unallocated blocks) come from the parent disk, which is
  *                 found through the parent locators / parent name and opened
- *                 with o->open_volume (GZ_E_METHOD when it cannot be opened)
+ *                 with o->open_volume (GZ_E_METHOD when it cannot be opened);
+ *                 each disk's locators are relative to its own folder, and
+ *                 only files inside that folder are opened
  *
  * All fields are big-endian. Sectors are 512 bytes.
  */
@@ -81,10 +83,13 @@ static int read_footer(gz_src *s, u8 *f, u64 *data_end)
     return seen ? GZ_E_CRC : GZ_E_FORMAT;
 }
 
-static int vhd_parse(gz_archive *a, gz_src *s, const gz_open_opts *o, u32 depth, vhd_img **out);
+static int vhd_parse(gz_archive *a, gz_src *s, const gz_open_opts *o, const gzch *path, u32 depth, vhd_img **out);
 
-/* Find and open the parent of a differencing disk (h = dynamic header). */
-static int open_parent(gz_archive *a, vhd_img *im, const u8 *h, gz_src *s, const gz_open_opts *o, u32 depth)
+/* Find and open the parent of a differencing disk (h = dynamic header). path = this disk's
+ * file (NULL: the opened image): its locators are relative to its own folder, and only files
+ * inside that folder are opened (see gz_vd_open_file16_at). */
+static int open_parent(gz_archive *a, vhd_img *im, const u8 *h, gz_src *s, const gz_open_opts *o, const gzch *path,
+                       u32 depth)
 {
     if (depth + 1 >= GZ_VD_MAX_DEPTH) return GZ_E_LIMIT;
     if (!o || !o->open_volume) return GZ_E_METHOD;
@@ -117,11 +122,13 @@ static int open_parent(gz_archive *a, vhd_img *im, const u8 *h, gz_src *s, const
         }
         if (!n) continue;
         gz_src *ps;
-        int r = gz_vd_open_file16(a, o, name, n, &ps);
+        gzch *pp;
+        int r = gz_vd_open_file16_at(a, o, path, name, n, &ps, &pp);
         if (r == GZ_E_CANCEL || r == GZ_E_NOMEM || r == GZ_E_LIMIT) return r;
         if (r) continue;
         vhd_img *p = 0;
-        r = vhd_parse(a, ps, o, depth + 1, &p);
+        r = vhd_parse(a, ps, o, pp, depth + 1, &p);     /* its own parent: next to it */
+        gz_free(pp);
         if (r == GZ_E_CANCEL || r == GZ_E_NOMEM || r == GZ_E_LIMIT) return r;
         if (r) continue;
         if (__builtin_memcmp(p->uid, h + 40, 16)) { img_free(p); continue; }   /* not our parent */
@@ -132,7 +139,7 @@ static int open_parent(gz_archive *a, vhd_img *im, const u8 *h, gz_src *s, const
     return GZ_E_METHOD;
 }
 
-static int vhd_parse(gz_archive *a, gz_src *s, const gz_open_opts *o, u32 depth, vhd_img **out)
+static int vhd_parse(gz_archive *a, gz_src *s, const gz_open_opts *o, const gzch *path, u32 depth, vhd_img **out)
 {
     u8 f[512];
     u64 dend;
@@ -175,7 +182,7 @@ static int vhd_parse(gz_archive *a, gz_src *s, const gz_open_opts *o, u32 depth,
         if (nbat && (r = gz_src_read_exact(s, bat_off, im->bat, (u32)nbat * 4))) goto fail;
         for (u32 i = 0; i < im->nbat; i++) im->bat[i] = __builtin_bswap32(im->bat[i]);
         im->bmp_bytes = ((((bs >> 9) + 7) >> 3) + 511) & ~511u;
-        if (im->type == VHD_DIFF && (r = open_parent(a, im, h, s, o, depth))) goto fail;
+        if (im->type == VHD_DIFF && (r = open_parent(a, im, h, s, o, path, depth))) goto fail;
     }
     *out = im;
     return GZ_OK;
@@ -264,7 +271,7 @@ static int vhd_open(gz_archive *a, gz_src *s, const gz_open_opts *o, gz_ctx *c)
 {
     (void)c;
     vhd_img *im;
-    int r = vhd_parse(a, s, o, 0, &im);
+    int r = vhd_parse(a, s, o, 0, 0, &im);
     if (r) return r;
     a->priv = im;
     gz_entry *e;
