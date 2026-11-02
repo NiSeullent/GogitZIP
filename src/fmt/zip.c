@@ -420,9 +420,13 @@ static int zip_open(gz_archive *a, gz_src *s, const gz_open_opts *o, gz_ctx *c)
     }
 
     a->win_names = 1;
-    if (count < (1u << 24) && count > 0) {
-        a->e = (gz_entry *)gz_alloc((size_t)count * sizeof(gz_entry));
-        if (a->e) a->cap = (u32)count;
+    /* the count is only a hint for the array size: every central record takes at
+     * least 46 bytes, so the directory bounds it (a forged ZIP64 count must not
+     * drive a huge allocation) */
+    u64 hint = count < cd_size / 46 ? count : cd_size / 46;
+    if (hint < (1u << 24) && hint > 0) {
+        a->e = (gz_entry *)gz_alloc((size_t)hint * sizeof(gz_entry));
+        if (a->e) a->cap = (u32)hint;
     }
     a->raw = 0;
     size_t p = 0;
@@ -882,12 +886,17 @@ static int extract_once(gz_archive *a, gz_src *s, u32 idx, gz_out *out, const u8
     }
 
     if (!st && total != e->usize) st = GZ_E_DATA;
-    if (!st && e->has_crc && crc != e->crc)
-        st = (e->enc == GZ_ENC_ZIPCRYPTO) ? GZ_E_PASSWORD : GZ_E_CRC;
-    if (!st && e->enc == GZ_ENC_AES) {
+    if (!st && e->has_crc && crc != e->crc) st = GZ_E_CRC;
+    /* A wrong password can pass the 1-byte ZipCrypto check (1 in 256) or the
+     * 2-byte AES verifier (1 in 65536); the decoder then sees garbage. */
+    int bad = st == GZ_E_DATA || st == GZ_E_CRC || st == GZ_E_TRUNC;
+    if (e->enc == GZ_ENC_AES && (!st || bad)) {
+        /* the HMAC covers the ciphertext: check it even when decoding failed, so a
+         * wrong key or tampered data (GZ_E_AUTH) is told apart from a damaged
+         * stream inside an authentic entry (decoder error kept) */
         u8 code[10], mac[20];
         int rr = read_exact(src, rd.end, code, 10);
-        if (rr) st = rr;
+        if (rr) { if (!st) st = rr; }
         else {
             /* the reader may stop early when the decoder ends: hash the rest */
             u8 tmp[4096];
@@ -900,6 +909,8 @@ static int extract_once(gz_archive *a, gz_src *s, u32 idx, gz_out *out, const u8
             gz_hmac_final(&ac->hmac, mac);
             if (__builtin_memcmp(code, mac, 10)) st = GZ_E_AUTH;
         }
+    } else if (e->enc == GZ_ENC_ZIPCRYPTO && bad) {
+        st = GZ_E_PASSWORD;         /* no MAC: bad data behind ZipCrypto means a wrong key (as 7-Zip) */
     }
     gz_free(ac);
     if (src != s) gz_src_free(src);

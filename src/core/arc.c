@@ -55,7 +55,8 @@ int gz_arc_add_entry(gz_archive *a, gz_entry **pe)
 int gz_arc_raw_append(gz_archive *a, const void *p, size_t n, u32 *off)
 {
     if (a->raw_len + n > 0xffffffffu) return GZ_E_LIMIT;
-    if (a->raw_len + n > a->raw_cap) {
+    /* allocate even for an empty name: readers form a->raw + raw_off for every entry */
+    if (!a->raw || a->raw_len + n > a->raw_cap) {
         size_t nc = a->raw_cap ? a->raw_cap : 65536;
         while (nc < a->raw_len + n) nc *= 2;
         u8 *nr = (u8 *)gz_realloc(a->raw, nc);

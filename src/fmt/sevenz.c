@@ -135,6 +135,14 @@ static void streams_free(sz_streams *st)
     __builtin_memset(st, 0, sizeof *st);
 }
 
+/* A coder's properties. st->props stays NULL when no coder of the archive has
+ * any (Copy, BCJ, Swap...): never form an offset from that null pointer. */
+static const u8 *coder_props(const sz_streams *st, const sz_coder *cd)
+{
+    static const u8 none[1];
+    return st->props ? st->props + cd->prop : none;
+}
+
 static void dvec_free(sz_dvec *dv)
 {
     for (u32 i = 0; i < dv->n; i++) if (dv->b[i].p) gz_free_big(dv->b[i].p, dv->b[i].n ? dv->b[i].n : 1);
@@ -778,7 +786,7 @@ static int derive_key(gz_ctx *c, const gzch *pw, const sz_aes_par *ap, u8 key[32
 static int aes_setup(sz_dec *d, const sz_coder *cd, sz_aes_rd *a)
 {
     sz_aes_par ap;
-    int r = aes_params(d->st->props + cd->prop, cd->nprop, &ap);
+    int r = aes_params(coder_props(d->st, cd), cd->nprop, &ap);
     if (r) return r;
     if (!d->pw) return GZ_E_PASSWORD;
     u8 key[32];
@@ -968,7 +976,7 @@ static int ppmd_decode(sz_dec *d, const u8 *props, u32 np, const gz_stream_io *i
 /* run a decoder coder: input from x->rd, output to x->sink */
 static int run_decoder(sz_dec *d, const sz_coder *cd, u64 osz, sz_io *x)
 {
-    const u8 *pp = d->st->props + cd->prop;
+    const u8 *pp = coder_props(d->st, cd);
     gz_stream_io io = { io_rd, io_wr, x };
     u32 bit = 1u << cd->kind;
     if (d->busy & bit) return GZ_E_METHOD;       /* cannot happen in a validated graph */
@@ -1024,7 +1032,7 @@ static int run_decoder(sz_dec *d, const sz_coder *cd, u64 osz, sz_io *x)
 static int push_coder(sz_dec *d, u32 ci, sz_sink sink, void *sctx)
 {
     const sz_coder *cd = &d->co[ci];
-    const u8 *pp = d->st->props + cd->prop;
+    const u8 *pp = coder_props(d->st, cd);
     u64 osz = d->us[ci];
     int r;
     if (gz_cancelled(d->c)) return GZ_E_CANCEL;
@@ -1759,7 +1767,7 @@ static int sz_check_password(gz_archive *a, gz_src *s, u32 idx, gz_ctx *c)
         if (cd->kind == K_AES) aes = aes ? (const sz_coder *)-1 : cd;
     }
     sz_aes_par ap;
-    int one = aes && aes != (const sz_coder *)-1 && !aes_params(p->st.props + aes->prop, aes->nprop, &ap);
+    int one = aes && aes != (const sz_coder *)-1 && !aes_params(coder_props(&p->st, aes), aes->nprop, &ap);
     sz_kc_ent *ke = one ? kc_find(c, c->password, &ap, 0) : 0;
     if (ke && ke->ok) return GZ_OK;
     const gz_entry *e0 = &a->e[f->first_entry];
@@ -1880,7 +1888,7 @@ static void sz_method(const gz_archive *a, const gz_entry *e, char *buf, u32 cap
         for (u32 k = f->ncoders; k-- > 0;) {        /* 7-Zip lists the last coder first */
             if (s.i) ps(&s, " ");
             const sz_coder *cd = &p->st.co[f->coder0 + k];
-            coder_text(&s, cd, p->st.props + cd->prop);
+            coder_text(&s, cd, coder_props(&p->st, cd));
         }
     }
     if (cap) buf[s.i] = 0;

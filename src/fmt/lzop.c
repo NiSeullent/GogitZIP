@@ -228,7 +228,11 @@ static void lzop_info(gz_src *s, gz_stream_info *inf, gz_ctx *c)
     __builtin_memcpy(inf->name, h.name, h.name_len);
     inf->name_len = h.name_len;
     inf->name_enc = (h.flags & F_CS_MASK) == F_CS_UTF8 ? GZ_NE_UTF8 : GZ_NE_LEGACY;
-    if (h.mtime) { inf->mtime = h.mtime; inf->has_mtime = 1; }
+    /* only times a FILETIME can hold: the high word allows absurd values */
+    if (h.mtime && h.mtime >= -11644473600LL && h.mtime <= 910692730085LL) {
+        inf->mtime = h.mtime;
+        inf->has_mtime = 1;
+    }
     u64 total = 0, q = h.data;
     u32 fl = h.flags;
     for (u32 nblk = 0;; nblk++) {
