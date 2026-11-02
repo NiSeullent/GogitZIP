@@ -38,6 +38,12 @@ int gz_cpio_list_stream(gz_archive *a, gz_src *s, gz_decode_fn dec, gz_ctx *c);
 int gz_cpio_extract_stream(gz_archive *a, gz_src *s, gz_decode_fn dec, const u8 *sel,
                            gz_out *out, gz_ctx *c);
 
+/* (key, index) pairs sorted by key, stable: hard link groups of cpio (device +
+ * inode) and XAR (file ids). Keys come from the archive, so no hash table: O(n log n)
+ * whatever the keys. Returns GZ_OK or GZ_E_NOMEM. */
+typedef struct { u64 key; u32 idx; } gz_keyidx;
+int gz_keyidx_sort(gz_keyidx *v, u32 n);
+
 /* Registered single-stream format (gzip, bzip2, xz, zstd, lz4, pbzx, ...) whose
  * probe gives the best score for s, NULL when none accepts it. */
 const gz_stream_codec *gz_stream_codec_find(gz_src *s);
