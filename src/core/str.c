@@ -49,9 +49,14 @@ int gz_wcs_endswith(const gzch *s, const char *ext)
     return 1;
 }
 
+/* Unix seconds -> FILETIME. Times from archive headers can be anything: those before
+ * 1601 or so late that FILETIME (plus a sub-second part) cannot hold them give 0 (unknown). */
 u64 gz_unix_to_filetime(i64 t)
 {
-    return (u64)(t * 10000000LL + 116444736000000000LL);
+    const i64 lo = -11644473600LL;                                     /* 1601-01-01 */
+    const i64 hi = (i64)((0xFFFFFFFFFFFFFFFFULL - 9999999u) / 10000000u) + lo;
+    if (t < lo || t > hi) return 0;
+    return (u64)(t - lo) * 10000000u;
 }
 
 i64 gz_filetime_to_unix(u64 ft)

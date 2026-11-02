@@ -23,6 +23,15 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/time.h>
+/* The macOS quarantine mark lives in an extended attribute. GZ_TEST_MARK_XATTR (test
+ * builds on Linux only) keeps it in the user.com.apple.quarantine attribute so that
+ * the engine's macOS behaviour can be tested there. */
+#if defined(__APPLE__)
+#  define MARK_XATTR "com.apple.quarantine"
+#elif defined(GZ_TEST_MARK_XATTR)
+#  include <sys/xattr.h>
+#  define MARK_XATTR "user.com.apple.quarantine"
+#endif
 #ifdef __APPLE__
 #  include <sys/xattr.h>
 #  define ST_ATIM(s) ((s)->st_atimespec)
@@ -72,8 +81,10 @@ int gz_os_err_gz(int e, int fallback)
 
 u32 gz_os_caps(void)
 {
-#ifdef __APPLE__
-    return GZ_OSC_LINKS | GZ_OSC_MODES | GZ_OSC_NFD_NAMES | GZ_OSC_CASE_FOLD | GZ_OSC_MARK;
+#if defined(__APPLE__)
+    return GZ_OSC_LINKS | GZ_OSC_MODES | GZ_OSC_NFD_NAMES | GZ_OSC_CASE_FOLD | GZ_OSC_MARK | GZ_OSC_MARK_ALL;
+#elif defined(MARK_XATTR)
+    return GZ_OSC_LINKS | GZ_OSC_MODES | GZ_OSC_MARK | GZ_OSC_MARK_ALL;
 #else
     return GZ_OSC_LINKS | GZ_OSC_MODES;
 #endif
@@ -214,9 +225,8 @@ static void np_free(npath *np)
 
 static u64 ts_ft(struct timespec t)
 {
-    i64 s = (i64)t.tv_sec;
-    if (s < -11644473600LL) return 0;
-    return gz_unix_to_filetime(s) + (u64)(t.tv_nsec / 100);
+    u64 ft = gz_unix_to_filetime((i64)t.tv_sec);    /* 0: out of FILETIME's range */
+    return ft ? ft + (u64)(t.tv_nsec / 100) : 0;
 }
 
 static struct timespec ft_ts(u64 ft)
@@ -567,9 +577,14 @@ int gz_os_create_temp(const gzch *prefix, gzch *path, u32 cap, gz_fd *fd)
 int gz_os_mark_get(const gzch *path, u8 *buf, u32 cap, u32 *n)
 {
     *n = 0;
-#ifdef __APPLE__
+#if defined(__APPLE__)
     WITH_PATH(np, path);
-    ssize_t r = getxattr(np.p, "com.apple.quarantine", buf, cap, 0, 0);
+    ssize_t r = getxattr(np.p, MARK_XATTR, buf, cap, 0, 0);
+    np_free(&np);
+    if (r > 0 && (size_t)r <= cap) *n = (u32)r;
+#elif defined(MARK_XATTR)
+    WITH_PATH(np, path);
+    ssize_t r = getxattr(np.p, MARK_XATTR, buf, cap);
     np_free(&np);
     if (r > 0 && (size_t)r <= cap) *n = (u32)r;
 #else
@@ -580,11 +595,26 @@ int gz_os_mark_get(const gzch *path, u8 *buf, u32 cap, u32 *n)
 
 void gz_os_mark_set(gz_fd fd, const gzch *path, const u8 *p, u32 n)
 {
-    (void)path;
-#ifdef __APPLE__
-    if (n && fd != GZ_FD_NONE) fsetxattr(FD(fd), "com.apple.quarantine", p, n, 0, 0);
+#if defined(MARK_XATTR)
+    if (!n) return;
+    if (fd != GZ_FD_NONE) {
+#  ifdef __APPLE__
+        fsetxattr(FD(fd), MARK_XATTR, p, n, 0, 0);
+#  else
+        fsetxattr(FD(fd), MARK_XATTR, p, n, 0);
+#  endif
+        return;
+    }
+    npath np;                                 /* a folder or a link: the item itself */
+    if (np_get(&np, path)) return;
+#  ifdef __APPLE__
+    setxattr(np.p, MARK_XATTR, p, n, 0, XATTR_NOFOLLOW);
+#  else
+    lsetxattr(np.p, MARK_XATTR, p, n, 0);
+#  endif
+    np_free(&np);
 #else
-    (void)fd; (void)p; (void)n;
+    (void)fd; (void)path; (void)p; (void)n;
 #endif
 }
 

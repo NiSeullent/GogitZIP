@@ -209,6 +209,39 @@ static void pick_language(void)
 
 static char *utf8s(const gzch *w) { return w ? gz_os_path_bytes(w) : 0; }   /* gz_free */
 
+/* Text from an archive (names, link targets, comments, paths built from them) for the
+ * terminal: control characters (C0, DEL, C1) and raw bytes of invalid UTF-8 are written
+ * as \xNN, so the archive cannot send escape sequences. multiline keeps \n and \t. */
+static char *show_text(const gzch *w, int multiline)
+{
+    if (!w) return 0;
+    size_t n = gz_wcslen(w), o = 0;
+    gzch *t = (gzch *)gz_alloc((n * 4 + 1) * sizeof(gzch));
+    if (!t) return 0;
+    for (size_t i = 0; i < n; i++) {
+        gzch c = w[i];
+        if (c >= 0xD800 && c < 0xDC00 && w[i + 1] >= 0xDC00 && w[i + 1] < 0xE000) {
+            t[o++] = c;                               /* a pair: not a raw byte */
+            t[o++] = w[++i];
+            continue;
+        }
+        u32 b = 0x100;                                /* byte to escape, if any */
+        if (c >= 0xDC80 && c <= 0xDCFF) b = c - 0xDC00;
+        else if ((c < 0x20 && !(multiline && (c == '\n' || c == '\t'))) || (c >= 0x7F && c <= 0x9F)) b = c;
+        if (b > 0xFF) { t[o++] = c; continue; }
+        t[o++] = '\\';
+        t[o++] = 'x';
+        t[o++] = (gzch)"0123456789ABCDEF"[b >> 4];
+        t[o++] = (gzch)"0123456789ABCDEF"[b & 15];
+    }
+    t[o] = 0;
+    char *s = gz_os_path_bytes(t);
+    gz_free(t);
+    return s;
+}
+
+static char *show(const gzch *w) { return show_text(w, 0); }                  /* gz_free */
+
 static gzch *wide(const char *s) { return gz_os_path_wide(s); }
 
 static char *xstrdup(const char *s)
@@ -350,14 +383,14 @@ static int read_line(const char *prompt, char *buf, size_t cap, int echo)
 
 static void print_wrapped(FILE *f, const char *label, const gzch *w)
 {
-    char *s = utf8s(w);
+    char *s = show(w);
     fprintf(f, "%s%s\n", label, s ? s : "");
     gz_free(s);
 }
 
 static int ask_overwrite(gz_ask *q)
 {
-    char *p = utf8s(q->path);
+    char *p = show(q->path);
     if (!g.interactive) {
         gz_os_mutex_lock(g.tty);
         clear_line();
@@ -375,7 +408,7 @@ static int ask_overwrite(gz_ask *q)
     fmt_time(t2, q->new_mtime);
     fprintf(stderr, "\n%s:\n  %s\n  %llu %s  %s\n", T(M_OW_HEAD), p ? p : "",
             (unsigned long long)q->old_size, T(M_BYTES), t1);
-    char *en = utf8s(q->entry);
+    char *en = show(q->entry);
     fprintf(stderr, "%s:\n  %s\n  %llu %s  %s\n", T(M_OW_WITH), en ? en : "", (unsigned long long)q->new_size,
             T(M_BYTES), t2);
     gz_free(en);
@@ -414,7 +447,7 @@ static int ask_password(gz_ask *q)
     gz_os_mutex_lock(g.tty);
     g.prompting = 1;
     clear_line();
-    char *p = utf8s(q->path), prompt[4200];
+    char *p = show(q->path), prompt[4200];
     snprintf(prompt, sizeof prompt, "%s (%s): ", q->retry ? T(M_PW_RETRY) : T(M_PW_PROMPT), p ? p : "");
     gz_free(p);
     char line[1024];
@@ -501,7 +534,7 @@ static void cb_progress(void *user, const gz_progress *p)
             cols += w;
             st--;
         }
-        char *s = utf8s(cur + st);
+        char *s = show(cur + st);
         fprintf(stderr, "\r%s %s\033[K", head, s ? s : "");
         gz_free(s);
         fflush(stderr);
@@ -516,7 +549,7 @@ static void cb_log(void *user, const gz_log *l)
     gz_os_mutex_lock(g.tty);
     clear_line();
     const char *lv = l->level == GZ_LOG_ERROR ? T(M_ERROR) : l->level == GZ_LOG_WARN ? T(M_WARNING) : T(M_NOTE);
-    char *n = utf8s(l->name), *d = utf8s(l->detail);
+    char *n = show(l->name), *d = show(l->detail);
     if (l->code == GZ_E_PASSWORD && g.pw_hint) {
         fprintf(stderr, "%s: %s : %s\n", lv, n ? n : "", code_text(l->code));
     } else if (d) {
@@ -768,7 +801,7 @@ static int cmd_list(opts *o)
     u8 *sel = select_names(a, o, &cnt);
     printf("%s: %s\n\n", T(M_LISTING), ap);
     printf("Path = %s\nType = %s\nPhysical Size = %llu\n", ap, gz_arc_type_name(a), (unsigned long long)h->src->size);
-    if (a->comment) { char *c = utf8s(a->comment); printf("Comment = %s\n", c ? c : ""); gz_free(c); }
+    if (a->comment) { char *c = show_text(a->comment, 1); printf("Comment = %s\n", c ? c : ""); gz_free(c); }
     printf("\n");
     u64 tu = 0, tc = 0;
     u32 nf = 0, nd = 0;
@@ -781,7 +814,7 @@ static int cmd_list(opts *o)
     for (u32 i = 0; i < a->n; i++) {
         gz_entry *e = &a->e[i];
         if ((sel && !sel[i]) || !e->name[0]) continue;
-        char t[32], at[8], *nm = utf8s(e->name);
+        char t[32], at[8], *nm = show(e->name);
         fmt_time(t, gz_entry_time(e));
         attr_text(e, at);
         if (e->is_dir) nd++;
@@ -798,7 +831,7 @@ static int cmd_list(opts *o)
         } else {
             gzch mw[96];
             gz_arc_method(a, e, mw, 96);
-            char *m = utf8s(mw);
+            char *m = show(mw);
             char md[16];
             printf("Path = %s\nFolder = %s\n", nm ? nm : "", e->is_dir ? "+" : "-");
             if (!e->is_dir) printf("Size = %s\nPacked Size = %s\n", us, cs);
@@ -810,7 +843,7 @@ static int cmd_list(opts *o)
             if (m && m[0]) printf("Method = %s\n", m);
             gzch *lt = gz_entry_link_target(a, e);
             if (lt) {
-                char *ls = utf8s(lt);
+                char *ls = show(lt);
                 printf("%s = %s\n", e->is_link == 2 ? "Hard Link" : "Symbolic Link", ls ? ls : "");
                 gz_free(ls);
                 gz_free(lt);
@@ -900,7 +933,7 @@ static int cmd_extract(opts *o)
     int res = wait_job(j);
     int ex = job_exit(j, res);
     if (!xo.test) {
-        char *d = utf8s(gz_job_dest(j));
+        char *d = show(gz_job_dest(j));
         printf("%s: %s\n", T(M_DEST), d ? d : dest);
         gz_free(d);
     }

@@ -218,6 +218,13 @@ static int vote_ambiguous(const u8 *s, size_t n, int acp)
     return u > l;
 }
 
+/* name bytes at off in a->raw (a->raw stays NULL while every name is empty) */
+static const u8 *raw_at(const gz_archive *a, u32 off)
+{
+    static const u8 none[1];
+    return a->raw ? a->raw + off : none;
+}
+
 static int choose_codepage(gz_archive *a)
 {
     if (a->codepage != GZ_CP_AUTO) return a->codepage;
@@ -228,8 +235,8 @@ static int choose_codepage(gz_archive *a)
     int legacy = 0, all_utf8 = 1, sure = 0, vu = 0, vl = 0;
     for (u32 i = 0; i < a->n; i++) {
         gz_entry *e = &a->e[i];
-        if (e->uni_len || e->name_enc != GZ_NE_LEGACY) continue;
-        const u8 *r = a->raw + e->raw_off;
+        if (e->uni_len || e->name_enc != GZ_NE_LEGACY || !e->raw_len) continue;
+        const u8 *r = raw_at(a, e->raw_off);
         if (name_is_ascii(r, e->raw_len)) continue;
         legacy = 1;
         if (!gz_utf8_valid(r, e->raw_len)) { all_utf8 = 0; break; }
@@ -272,7 +279,9 @@ static int decode_raw(const u8 *r, size_t rn, int ne, int cp, gzch *out)
     return n;
 }
 
-/* Decode + normalise one name into out (capacity >= name_cap(rn)). Returns length. */
+/* Decode + normalise one name into out (capacity >= name_cap(rn)). Returns length.
+ * A name deeper than GZ_NAME_MAX_DEPTH keeps its first GZ_NAME_MAX_DEPTH - 2 components
+ * and its last one; the components in between become one, joined with '_'. */
 static int decode_name(const u8 *r, size_t rn, int ne, int cp, gzch *out)
 {
     int n = decode_raw(r, rn, ne, cp, out);
@@ -280,6 +289,7 @@ static int decode_name(const u8 *r, size_t rn, int ne, int cp, gzch *out)
 
     /* normalise separators and drop dangerous components */
     int o = 0, i = 0;
+    u32 depth = 0;
     while (i < n) {
         while (i < n && (out[i] == '/' || out[i] == '\\')) i++;
         int st = i;
@@ -290,6 +300,7 @@ static int decode_name(const u8 *r, size_t rn, int ne, int cp, gzch *out)
         if (len == 2 && out[st] == '.' && out[st + 1] == '.') continue;
         if (o == 0 && len == 2 && out[st + 1] == ':') continue;     /* "C:" */
         if (o) out[o++] = '/';
+        depth++;
         for (int k = 0; k < len; k++) {
             gzch c = out[st + k];
             if (c < 0x20) c = '_';
@@ -297,12 +308,24 @@ static int decode_name(const u8 *r, size_t rn, int ne, int cp, gzch *out)
         }
     }
     out[o] = 0;
+    if (depth > GZ_NAME_MAX_DEPTH) {
+        /* separator k sits between components k and k + 1 */
+        u32 k = 0;
+        for (int x = 0; x < o; x++) {
+            if (out[x] != '/') continue;
+            if (k >= GZ_NAME_MAX_DEPTH - 2 && k + 2 < depth) out[x] = '_';
+            k++;
+        }
+    }
     return o;
 }
 
-static u32 path_hash(const gz_archive *a, const gzch *s, u32 n)
+/* Folders are found by (parent, component), so a lookup walks a path once whatever
+ * its depth. Every folder keeps its full path (front ends use it): folder names cost
+ * depth x length units, which gz_arc_build_tree keeps within a budget. */
+static u32 comp_hash(const gz_archive *a, i32 parent, const gzch *s, u32 n)
 {
-    u32 h = 2166136261u;
+    u32 h = 2166136261u ^ ((u32)parent * 0x9E3779B1u);
     for (u32 i = 0; i < n; i++) {
         gzch c = s[i];
         if (a->case_fold && c >= 'A' && c <= 'Z') c += 32;
@@ -311,23 +334,32 @@ static u32 path_hash(const gz_archive *a, const gzch *s, u32 n)
     return h;
 }
 
-static int path_eq(const gz_archive *a, const gzch *x, const gzch *y, u32 n)
+/* component s[0..n) equals the NUL-terminated base b */
+static int comp_eq(const gz_archive *a, const gzch *s, u32 n, const gzch *b)
 {
     for (u32 i = 0; i < n; i++) {
-        gzch p = x[i], q = y[i];
+        gzch p = s[i], q = b[i];
+        if (!q) return 0;
         if (a->case_fold) {
             if (p >= 'A' && p <= 'Z') p += 32;
             if (q >= 'A' && q <= 'Z') q += 32;
         }
-        if (p != q || !y[i]) return 0;
+        if (p != q) return 0;
     }
-    return y[n] == 0;
+    return b[n] == 0;
 }
 
-static int fhash_insert(gz_archive *a, i32 idx);
+static void fhash_insert(gz_archive *a, i32 idx)
+{
+    const gz_folder *f = &a->f[idx];
+    u32 h = comp_hash(a, f->parent, f->base, (u32)gz_wcslen(f->base)) & (a->fhash_cap - 1);
+    while (a->fhash[h] >= 0) h = (h + 1) & (a->fhash_cap - 1);
+    a->fhash[h] = idx;
+}
 
 static int fhash_grow(gz_archive *a)
 {
+    if (a->fhash_cap >= (1u << 30)) return GZ_E_LIMIT;
     u32 nc = a->fhash_cap ? a->fhash_cap * 2 : 1024;
     i32 *nh = (i32 *)gz_alloc((size_t)nc * sizeof(i32));
     if (!nh) return GZ_E_NOMEM;
@@ -339,30 +371,22 @@ static int fhash_grow(gz_archive *a)
     return GZ_OK;
 }
 
-static int fhash_insert(gz_archive *a, i32 idx)
+static i32 folder_child(gz_archive *a, i32 parent, const gzch *s, u32 n)
 {
-    const gzch *nm = a->f[idx].name;
-    u32 h = path_hash(a, nm, (u32)gz_wcslen(nm)) & (a->fhash_cap - 1);
-    while (a->fhash[h] >= 0) h = (h + 1) & (a->fhash_cap - 1);
-    a->fhash[h] = idx;
-    return GZ_OK;
-}
-
-static i32 folder_find(gz_archive *a, const gzch *p, u32 n)
-{
-    if (!n) return 0;
-    u32 h = path_hash(a, p, n) & (a->fhash_cap - 1);
+    u32 h = comp_hash(a, parent, s, n) & (a->fhash_cap - 1);
     while (a->fhash[h] >= 0) {
         i32 i = a->fhash[h];
-        if (path_eq(a, p, a->f[i].name, n)) return i;
+        if (a->f[i].parent == parent && comp_eq(a, s, n, a->f[i].base)) return i;
         h = (h + 1) & (a->fhash_cap - 1);
     }
     return -1;
 }
 
+/* new folder with full path p[0..n) below parent */
 static i32 folder_new(gz_archive *a, const gzch *p, u32 n, i32 parent)
 {
     if (a->nf == a->capf) {
+        if (a->capf >= (1u << 28)) return -1;
         u32 nc = a->capf ? a->capf * 2 : 64;
         gz_folder *nf = (gz_folder *)gz_realloc(a->f, (size_t)nc * sizeof(gz_folder));
         if (!nf) return -1;
@@ -370,13 +394,13 @@ static i32 folder_new(gz_archive *a, const gzch *p, u32 n, i32 parent)
         a->capf = nc;
     }
     if ((a->nf + 1) * 2 > a->fhash_cap && fhash_grow(a)) return -1;
+    gzch *nm = (gzch *)gz_arena_alloc(&a->names, ((size_t)n + 1) * sizeof(gzch));
+    if (!nm) return -1;
+    if (n) __builtin_memcpy(nm, p, (size_t)n * sizeof(gzch));
+    nm[n] = 0;
     i32 idx = (i32)a->nf++;
     gz_folder *f = &a->f[idx];
     __builtin_memset(f, 0, sizeof(*f));
-    gzch *nm = (gzch *)gz_arena_alloc(&a->names, (n + 1) * sizeof(gzch));
-    if (!nm) return -1;
-    if (n) __builtin_memcpy(nm, p, n * sizeof(gzch));
-    nm[n] = 0;
     f->name = nm;
     const gzch *sl = gz_wcsrchr(nm, '/');
     f->base = sl ? sl + 1 : nm;
@@ -392,26 +416,31 @@ static i32 folder_new(gz_archive *a, const gzch *p, u32 n, i32 parent)
     return idx;
 }
 
-/* Find or create the folder chain for path p[0..n) */
-static i32 folder_get(gz_archive *a, const gzch *p, u32 n)
+/* Find or create the folder chain for the normalised path p[0..n). A new folder costs
+ * its full path (+1) from *budget (UTF-16 units). Once the budget is spent, the rest of
+ * the path becomes one folder (its '/' turn into '_' in p itself): at most one folder,
+ * no longer than the name, per path. Returns the folder, -1 when out of memory. */
+static i32 folder_get(gz_archive *a, gzch *p, u32 n, u64 *budget)
 {
-    if (!n) return 0;
-    i32 f = folder_find(a, p, n);
-    if (f >= 0) return f;
-    i32 parent = 0;
+    i32 cur = 0;
     u32 i = 0;
-    while (i <= n) {
-        if (i == n || p[i] == '/') {
-            i32 x = folder_find(a, p, i);
-            if (x < 0) {
-                x = folder_new(a, p, i, parent);
-                if (x < 0) return -1;
-            }
-            parent = x;
+    while (i < n) {
+        u32 st = i;
+        while (i < n && p[i] != '/') i++;
+        i32 x = folder_child(a, cur, p + st, i - st);
+        if (x < 0 && (u64)i + 1 > *budget && i < n) {
+            for (i = st; i < n; i++) if (p[i] == '/') p[i] = '_';
+            x = folder_child(a, cur, p + st, n - st);
         }
-        i++;
+        if (x < 0) {
+            *budget -= (u64)i + 1 < *budget ? (u64)i + 1 : *budget;
+            x = folder_new(a, p, i, cur);
+            if (x < 0) return -1;
+        }
+        cur = x;
+        i++;                                  /* the '/' */
     }
-    return parent;
+    return cur;
 }
 
 static void decode_comment(gz_archive *a)
@@ -437,6 +466,10 @@ static void decode_comment(gz_archive *a)
     a->comment = c;
 }
 
+/* folder path budget: units always allowed + units per byte of raw names */
+#define FOLDER_NAMES_BASE (32u << 20)
+#define FOLDER_NAMES_PER_BYTE 4u
+
 int gz_arc_build_tree(gz_archive *a)
 {
     gz_arena_free(&a->names);
@@ -448,8 +481,7 @@ int gz_arc_build_tree(gz_archive *a)
     a->total_usize = a->total_csize = 0;
     a->has_enc = 0;
     a->any_utf8 = a->any_legacy = 0;
-    if (fhash_grow(a)) return GZ_E_NOMEM;
-    if (folder_new(a, u"", 0, -1) != 0) return GZ_E_NOMEM;
+    if (fhash_grow(a) || folder_new(a, u"", 0, -1) != 0) return GZ_E_NOMEM;
 
     a->used_cp = choose_codepage(a);
     if (!gz_plat_cp_valid(a->used_cp) && a->used_cp != GZ_CP_UTF8) a->used_cp = gz_plat_oemcp();
@@ -460,14 +492,16 @@ int gz_arc_build_tree(gz_archive *a)
     i32 last_folder = 0;
     u32 last_len = 0;
     const gzch *last_name = 0;
+    /* folder paths (UTF-16 units): plenty for real archives, linear in the input */
+    u64 budget = FOLDER_NAMES_BASE + (u64)a->raw_len * FOLDER_NAMES_PER_BYTE;
 
     for (u32 i = 0; i < a->n; i++) {
         gz_entry *e = &a->e[i];
         const u8 *r;
         size_t rn;
         int ne;
-        if (e->uni_len) { r = a->raw + e->uni_off; rn = e->uni_len; ne = GZ_NE_UTF8; }
-        else { r = a->raw + e->raw_off; rn = e->raw_len; ne = e->name_enc; }
+        if (e->uni_len) { r = raw_at(a, e->uni_off); rn = e->uni_len; ne = GZ_NE_UTF8; }
+        else { r = raw_at(a, e->raw_off); rn = e->raw_len; ne = e->name_enc; }
         if (ne == GZ_NE_LEGACY && !name_is_ascii(r, rn)) a->any_legacy = 1;
         else if (ne == GZ_NE_UTF8 && !name_is_ascii(r, rn)) a->any_utf8 = 1;
         if (name_cap(rn) > tmpcap) {
@@ -487,7 +521,7 @@ int gz_arc_build_tree(gz_archive *a)
         if (n == 0) { e->base = nm; continue; }      /* unusable name: hidden */
 
         if (e->is_dir) {
-            i32 f = folder_get(a, nm, (u32)n);
+            i32 f = folder_get(a, nm, (u32)n, &budget);
             if (f < 0) { gz_free(tmp); return GZ_E_NOMEM; }
             a->f[f].entry = (i32)i;
             a->f[f].mtime = e->mtime;
@@ -504,9 +538,9 @@ int gz_arc_build_tree(gz_archive *a)
             /* fast path: same directory as previous file */
             u32 k;
             for (k = 0; k < plen && nm[k] == last_name[k]; k++) {}
-            f = (k == plen) ? last_folder : folder_get(a, nm, plen);
+            f = (k == plen) ? last_folder : folder_get(a, nm, plen, &budget);
         } else {
-            f = folder_get(a, nm, plen);
+            f = folder_get(a, nm, plen, &budget);
         }
         if (f < 0) { gz_free(tmp); return GZ_E_NOMEM; }
         last_folder = f;
@@ -528,16 +562,28 @@ int gz_arc_build_tree(gz_archive *a)
 
 /* ---------------- layered views ---------------- */
 
+/* views between the outer file and a's data (archives above a) */
+static u32 layer_depth(const gz_archive *a)
+{
+    u32 d = 0;
+    for (; a->parent && d <= GZ_MAX_LAYERS; a = a->parent) d++;
+    return d;
+}
+
 /* Source to read archive a's entries from, given the caller's outer file. */
 gz_src *gz_arc_layer_src(gz_archive *a, gz_src *outer, gz_ctx *c)
 {
     if (!a->parent) return outer;
     if (c->view_arc == a && c->view_raw == outer && c->view_n) return c->view_chain[c->view_n - 1];
     ctx_drop_views(c);
-    /* collect the chain from the outermost archive inwards */
-    gz_archive *chain[8];
+    /* collect the chain from the outermost archive inwards; every view must be applied
+     * to the one above it, so a chain that does not fit is not readable at all */
+    gz_archive *chain[GZ_MAX_LAYERS];
     u32 depth = 0;
-    for (gz_archive *x = a; x->parent && depth < 8; x = x->parent) chain[depth++] = x;
+    for (gz_archive *x = a; x->parent; x = x->parent) {
+        if (depth == GZ_MAX_LAYERS) return 0;
+        chain[depth++] = x;
+    }
     gz_src *s = outer;
     for (u32 i = depth; i-- > 0;) {
         gz_archive *child = chain[i], *par = child->parent;
@@ -618,7 +664,8 @@ static int try_format(gz_archive **out, const gz_format *f, gz_src *src, const g
         return r;
     }
     /* disk images / partition maps: open the file system inside */
-    if ((f->flags & GZ_FMT_CONTAINER) && !(o->flags & GZ_OPEN_NO_DESCEND) && depth < MAX_DEPTH && f->view) {
+    if ((f->flags & GZ_FMT_CONTAINER) && !(o->flags & GZ_OPEN_NO_DESCEND) && depth < MAX_DEPTH && f->view &&
+        layer_depth(a) < GZ_MAX_LAYERS) {
         int pick = descend_candidate(a);
         if (pick >= 0) {
             gz_src *v = f->view(a, src, (u32)pick);
@@ -717,7 +764,8 @@ int gz_arc_open_child(gz_archive **out, gz_archive *parent, gz_src *parent_src, 
                       const gz_open_opts *o, gz_ctx *c)
 {
     *out = 0;
-    if (idx >= parent->n || !parent->fmt->view) return GZ_E_METHOD;
+    /* too deep for views: the caller extracts the entry and opens the copy instead */
+    if (idx >= parent->n || !parent->fmt->view || layer_depth(parent) >= GZ_MAX_LAYERS) return GZ_E_METHOD;
     gz_open_opts def;
     if (!o) { __builtin_memset(&def, 0, sizeof def); o = &def; }
     gz_src *s = gz_arc_layer_src(parent, parent_src, c);

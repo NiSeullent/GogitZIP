@@ -32,7 +32,10 @@ void gz_free_big(void *p, size_t n)
 
 /* ---------------- code pages ---------------- */
 
-static int g_acp = -1, g_oemcp = -1;
+/* set once by locale_cps (through g_cp_once: the first archive may be opened on any
+ * thread, and several at a time) */
+static int g_acp = 1252, g_oemcp = 437;
+static pthread_once_t g_cp_once = PTHREAD_ONCE_INIT;
 
 /* Windows ANSI / OEM code page matching the user's locale: legacy archive names
  * were written by Windows programs in those code pages. */
@@ -54,18 +57,19 @@ static void locale_cps(void)
         { "ar", 1256, 720 }, { "fa", 1256, 720 }, { "lt", 1257, 775 }, { "lv", 1257, 775 },
         { "et", 1257, 775 }, { "vi", 1258, 1258 }, { "th", 874, 874 },
     };
-    g_acp = 1252; g_oemcp = 850;
-    if (!strncmp(l, "en", 2) || !*l || !strcmp(l, "C") || !strncmp(l, "C.", 2) || !strcmp(l, "POSIX")) {
-        g_acp = 1252; g_oemcp = 437;
-    }
+    int acp = 1252, oem = 850;
+    if (!strncmp(l, "en", 2) || !*l || !strcmp(l, "C") || !strncmp(l, "C.", 2) || !strcmp(l, "POSIX"))
+        oem = 437;
     for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) {
         size_t n = strlen(map[i].pre);
-        if (!strncmp(l, map[i].pre, n)) { g_acp = map[i].acp; g_oemcp = map[i].oem; break; }
+        if (!strncmp(l, map[i].pre, n)) { acp = map[i].acp; oem = map[i].oem; break; }
     }
+    g_acp = acp;
+    g_oemcp = oem;
 }
 
-int gz_plat_acp(void) { if (g_acp < 0) locale_cps(); return g_acp; }
-int gz_plat_oemcp(void) { if (g_oemcp < 0) locale_cps(); return g_oemcp; }
+int gz_plat_acp(void) { pthread_once(&g_cp_once, locale_cps); return g_acp; }
+int gz_plat_oemcp(void) { pthread_once(&g_cp_once, locale_cps); return g_oemcp; }
 
 int gz_plat_case_fold(void)
 {

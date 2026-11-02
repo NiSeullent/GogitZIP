@@ -50,7 +50,9 @@ enum {
     GZ_OSC_NFD_NAMES  = 8,    /* the system may return decomposed names (macOS)  */
     GZ_OSC_CASE_FOLD  = 16,   /* usual file systems ignore case                  */
     GZ_OSC_MARK       = 32,   /* downloaded-file mark (quarantine / Zone.Identifier) */
-    GZ_OSC_ATTRS      = 64    /* DOS attributes (read-only, hidden, system) are kept */
+    GZ_OSC_ATTRS      = 64,   /* DOS attributes (read-only, hidden, system) are kept */
+    GZ_OSC_MARK_ALL   = 128   /* folders and links carry the mark too (macOS: an app
+                                 bundle is checked by its folder's quarantine)      */
 };
 u32 gz_os_caps(void);
 u32 gz_os_umask(void);        /* process umask (0 where meaningless), read once     */
@@ -120,7 +122,9 @@ int  gz_os_temp_dir(gzch *buf, u32 cap);
 int  gz_os_create_temp(const gzch *prefix, gzch *path, u32 cap, gz_fd *fd);
 
 /* Downloaded-file mark of an archive (macOS com.apple.quarantine, Windows
- * Zone.Identifier) and propagation to extracted files. *n = 0 when none. */
+ * Zone.Identifier) and propagation to extracted files. *n = 0 when none.
+ * gz_os_mark_set: a file just written (fd open, path its name); on GZ_OSC_MARK_ALL
+ * systems also fd GZ_FD_NONE: the folder or link at path itself (never followed). */
 int  gz_os_mark_get(const gzch *path, u8 *buf, u32 cap, u32 *n);
 void gz_os_mark_set(gz_fd fd, const gzch *path, const u8 *p, u32 n);
 
