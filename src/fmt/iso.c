@@ -13,7 +13,9 @@
  *
  * Hostile input: every directory extent is read once (loops), depth, path length,
  * CE chains, total directory bytes and entry count are bounded; extents outside the
- * image list as empty directories or fail with GZ_E_TRUNC on extraction.
+ * image list as empty directories or fail with GZ_E_TRUNC on extraction. File runs
+ * (multi-extent, interleaved) are charged to a budget that grows with the image size;
+ * a file over it is listed but refuses extraction (GZ_E_METHOD).
  */
 #include "arc.h"
 #include "isoudf.h"
@@ -27,7 +29,7 @@
 #define MAX_CE     32u                 /* continuation areas per record            */
 #define MAX_CE_LEN (64u << 10)
 #define MAX_ENTRIES (1u << 24)
-#define MAX_RUNS   (1u << 20)          /* runs of one interleaved file             */
+#define MAX_RUNS   (1u << 20)          /* runs of one multi-extent / interleaved file */
 #define DIRBUF     (64u << 10)
 
 enum { T_PRIMARY = 0, T_V2, T_JOLIET, T_RR };
@@ -53,6 +55,7 @@ typedef struct {
     iso_priv *p;
     u64 size;                 /* image size                                   */
     u64 budget;               /* directory + continuation bytes still allowed */
+    u64 runs_left;            /* file runs still allowed (xrun_budget)        */
     u64 done;                 /* directory bytes processed (progress)         */
     u32 bs;                   /* logical block size                           */
     int tree;
@@ -371,38 +374,52 @@ static u32 path_join(iso_rd *r, u32 plen, const u8 *nm, u32 n, int wide)
 
 static gz_entry *ent(iso_rd *r, i32 i) { return &r->a->e[i]; }
 
+/* Append one run of entry e. Every run costs one unit of the per-open budget (never refunded),
+ * and one file holds at most MAX_RUNS runs. */
+static int add_run(iso_rd *r, gz_entry *e, u64 fpos, u64 off, u64 len)
+{
+    if (!r->runs_left || r->p->runs.n - (u32)e->aux >= MAX_RUNS) return GZ_E_LIMIT;
+    r->runs_left--;
+    return xrun_add(&r->p->runs, fpos, off, len);
+}
+
 /* Turn entry idx into a run list (first extent) if it is still a single extent. */
 static int to_runs(iso_rd *r, gz_entry *e)
 {
     if (e->flags & F_MULTI) return GZ_OK;
     e->aux = r->p->runs.n;
     e->flags |= F_MULTI;
-    int rc = xrun_add(&r->p->runs, 0, e->off, e->usize);
-    e->aux32 = r->p->runs.n - (u32)e->aux;
-    return rc;
+    return add_run(r, e, 0, e->off, e->usize);
 }
 
-/* Add the data of one extent at file position fpos (interleaved: units of fus blocks, gap blocks apart). */
+/* Add the data of one extent at file position fpos (interleaved: units of fus blocks, gap blocks
+ * apart). Units past the end of the image can never be read: they become one run (extraction
+ * then fails with GZ_E_TRUNC like any extent outside the image). A file that needs more runs than
+ * the budget (or memory) allows keeps its size in the listing but is marked unsupported. */
 static int add_extent(iso_rd *r, gz_entry *e, u64 off, u32 len, u32 fus, u32 gap)
 {
     u64 fpos = e->usize;
-    if (!fus || !gap) {
-        if (!(e->flags & F_MULTI) && !fpos) { e->off = off; e->usize = e->csize = len; return GZ_OK; }
-        int rc = to_runs(r, e);
-        if (!rc) rc = xrun_add(&r->p->runs, fpos, off, len);
-        e->usize += len;
-        e->csize = e->usize;
-        e->aux32 = r->p->runs.n - (u32)e->aux;
-        return rc;
+    if (e->flags & F_UNSUP) {                             /* already given up: only the size counts */
+        e->usize = e->csize = fpos + len;
+        return GZ_OK;
     }
+    if ((!fus || !gap) && !(e->flags & F_MULTI) && !fpos) { e->off = off; e->usize = e->csize = len; return GZ_OK; }
     int rc = to_runs(r, e);
-    u64 unit = (u64)fus * r->bs, step = unit + (u64)gap * r->bs;
-    u32 left = len;
-    while (!rc && left) {
-        if (r->p->runs.n - (u32)e->aux >= MAX_RUNS) { e->flags |= F_UNSUP; break; }
-        u32 take = left < unit ? left : (u32)unit;
-        rc = xrun_add(&r->p->runs, fpos, off, take);
-        fpos += take; off += step; left -= take;
+    if (!fus || !gap) {
+        if (!rc) rc = add_run(r, e, fpos, off, len);
+    } else {
+        u64 unit = (u64)fus * r->bs, step = unit + (u64)gap * r->bs;
+        u32 left = len;
+        while (!rc && left) {
+            u32 take = off >= r->size || left < unit ? left : (u32)unit;
+            rc = add_run(r, e, fpos, off, take);
+            fpos += take; off += step; left -= take;
+        }
+    }
+    if (rc == GZ_E_LIMIT || rc == GZ_E_NOMEM) {           /* too many runs: drop them, keep listing */
+        r->p->runs.n = (u32)e->aux;
+        e->flags |= F_UNSUP;
+        rc = GZ_OK;
     }
     e->usize += len;
     e->csize = e->usize;
@@ -416,13 +433,16 @@ static void finish_multi(iso_rd *r)
     if (r->multi < 0) return;
     gz_entry *e = ent(r, r->multi);
     r->multi = -1;
-    if ((e->flags & (F_MULTI | F_UNSUP)) == F_MULTI && e->aux32 == 1 && e->aux + 1 == r->p->runs.n) {
+    if ((e->flags & (F_MULTI | F_UNSUP)) != F_MULTI) return;
+    if (e->aux32 == 1 && e->aux + 1 == r->p->runs.n) {
         e->off = r->p->runs.r[e->aux].off;
         r->p->runs.n--;
-        e->aux = 0;
-        e->aux32 = 0;
-        e->flags &= (u16)~F_MULTI;
-    }
+    } else if (e->aux32) {
+        return;
+    }                                                     /* else only empty extents: no data */
+    e->aux = 0;
+    e->aux32 = 0;
+    e->flags &= (u16)~F_MULTI;
 }
 
 /* Size of the directory at lba from its "." record (Rock Ridge CL targets). */
@@ -731,6 +751,7 @@ static int iso_open(gz_archive *a, gz_src *s, const gz_open_opts *o, gz_ctx *c)
     a->priv = p;
     r->p = p;
     r->budget = 2 * r->size + (64u << 20);
+    r->runs_left = xrun_budget(r->size);
 
     /* volume descriptor set */
     u8 *vd = r->buf;                                       /* [0] pvd [1] joliet [2] v2 [3] scratch */
@@ -820,6 +841,7 @@ static gz_src *iso_view(gz_archive *a, gz_src *s, u32 idx)
     gz_entry *e = &a->e[idx];
     if (e->is_dir || e->is_link || (e->flags & F_UNSUP)) return 0;
     if (!(e->flags & F_MULTI)) return gz_src_sub(s, e->off, e->usize);
+    if (!e->aux32) return gz_src_sub(s, 0, 0);            /* no runs: only empty extents */
     iso_priv *p = (iso_priv *)a->priv;
     if (e->aux + e->aux32 > p->runs.n) return 0;
     return xrun_view(s, p->runs.r + e->aux, e->aux32, e->usize);
@@ -829,7 +851,7 @@ static int iso_extract(gz_archive *a, gz_src *s, u32 idx, gz_out *out, gz_ctx *c
 {
     gz_entry *e = &a->e[idx];
     if (e->flags & F_UNSUP) return GZ_E_METHOD;
-    if (!(e->flags & F_MULTI) || e->is_dir || e->is_link) return gz_extract_stored(a, s, idx, e->off, out, c);
+    if (!(e->flags & F_MULTI) || !e->aux32 || e->is_dir || e->is_link) return gz_extract_stored(a, s, idx, e->off, out, c);
     gz_src *v = iso_view(a, s, idx);
     if (!v) return GZ_E_NOMEM;
     int r = gz_extract_stored(a, v, idx, 0, out, c);

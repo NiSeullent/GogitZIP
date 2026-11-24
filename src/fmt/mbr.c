@@ -104,7 +104,7 @@ static const char *sniff_fs(gz_src *s, u64 off, u64 len)
             !__builtin_memcmp(b + 1024, "BD", 2))
             return "hfs";
     }
-    if (!__builtin_memcmp(b + 512, "LABELONE", 8)) return "lvm";
+    if (n >= 520 && !__builtin_memcmp(b + 512, "LABELONE", 8)) return "lvm";   /* label in sector 1 */
     if (n == 4096 && (!__builtin_memcmp(b + 4086, "SWAPSPACE2", 10) || !__builtin_memcmp(b + 4086, "SWAP-SPACE", 10)))
         return "swap";
     if (fat_bpb(b)) return "fat";

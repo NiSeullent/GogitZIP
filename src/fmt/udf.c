@@ -17,7 +17,12 @@
  *
  * Hostile input: directory ICBs are visited once, depth / path / entry counts, ICB and
  * allocation extent chains, partition mapping depth and the total amount of directory
- * data are bounded; tables (VAT, sparing, directories) have size caps.
+ * data are bounded; tables (VAT, sparing, directories) have size caps. Mapping an
+ * allocation descriptor costs one step per contiguous piece (sparable packets that are
+ * not remapped and contiguous VAT entries are covered in one step), and every step is
+ * charged to a budget that grows with the image size (xrun_budget), so overlapping
+ * descriptors cannot make a small image build millions of runs. Hard links share the runs
+ * of the file entry expanded first.
  */
 #include "arc.h"
 #include "isoudf.h"
@@ -34,7 +39,7 @@
 #define MAX_SPARE  (1u << 16)          /* sparing table entries                    */
 #define MAX_LINK   4096u
 
-enum { F_MULTI = 1, F_BAD = 2 };       /* gz_entry.flags */
+enum { F_MULTI = 1, F_BAD = 2, F_LIMIT = 4 };   /* gz_entry.flags (F_LIMIT: too many runs) */
 enum { PM_NONE = 0, PM_PHYS, PM_SPAR, PM_VIRT, PM_META };
 
 /* tag identifiers */
@@ -52,13 +57,16 @@ typedef struct {
     i32 under;            /* VIRT / META: map the table / file lives in            */
     u32 pkt;              /* SPAR: packet length                                    */
     u32 nst, stsize, stloc[4];
-    u64 *spare; u32 nspare;   /* SPAR: (original << 32 | mapped), sorted            */
+    u64 *spare; u32 nspare;   /* SPAR: (original << 32 | mapped), sorted, packet aligned */
     u32 *vat; u32 nvat;   /* VIRT: virtual block -> block of under                 */
+    u16 *vrun;            /* VIRT: contiguous VAT entries from each one (capped)   */
     u32 mloc[2];          /* META: metadata file / mirror locations in under        */
     xrun_list meta;       /* META: metadata file data (image offsets)              */
 } udf_map;
 
 typedef struct { u32 b, m, depth; i32 entry; } dir_item;
+
+typedef struct { u64 key; u32 idx; } fe_seen;     /* expanded file entry -> its gz_entry */
 
 typedef struct {
     u32 ftype, flags, perm, m, ad_off, ad_len;
@@ -71,6 +79,7 @@ typedef struct {
     gz_ctx *c;
     udf_priv *p;
     u64 size, budget, done;
+    u64 steps;             /* mapping steps / runs still allowed (xrun_budget)     */
     u32 bs, nsec;
     udf_part parts[MAX_PARTS]; u32 nparts;
     udf_map maps[MAX_MAPS]; u32 nmaps;
@@ -79,6 +88,7 @@ typedef struct {
     u8 *dbuf; u32 dcap;    /* directory data                                       */
     xrun_list tmp;         /* runs of directories / symlinks / tables              */
     u64 *vis; u32 vis_n, vis_cap;
+    fe_seen *fs; u32 fs_n, fs_cap;    /* regular files by file entry location       */
     dir_item *q; u32 qh, qn, qcap;
     u32 root_b, root_m;
     u8 path[MAX_PATH + 1024];
@@ -151,15 +161,21 @@ static int map_block(udf_rd *u, u32 m, u32 b, u64 *sec, u32 *run, u32 depth)
         if (pt->len && b >= pt->len) return GZ_E_FORMAT;
         u32 rem = pt->len ? pt->len - b : 0xffffffffu - b;
         if (!rem) return GZ_E_FORMAT;
-        if (mp->type == PM_SPAR && mp->pkt) {
-            u32 in = b % mp->pkt, pk = b - in, left = mp->pkt - in;
-            if (left < rem) rem = left;
-            u32 lo = 0, hi = mp->nspare;              /* remapped packet? */
+        if (mp->type == PM_SPAR && mp->pkt && mp->nspare) {
+            u32 in = b % mp->pkt, pk = b - in;
+            u32 lo = 0, hi = mp->nspare;              /* first remapped packet >= pk */
             while (lo < hi) {
                 u32 mid = (lo + hi) / 2;
-                u32 o = (u32)(mp->spare[mid] >> 32);
-                if (o == pk) { *sec = (u64)(u32)mp->spare[mid] + in; *run = rem; return GZ_OK; }
-                if (o < pk) lo = mid + 1; else hi = mid;
+                if ((u32)(mp->spare[mid] >> 32) < pk) lo = mid + 1; else hi = mid;
+            }
+            if (lo < mp->nspare) {
+                u32 o = (u32)(mp->spare[lo] >> 32), left = mp->pkt - in;
+                if (o == pk) {                        /* remapped: the rest of this packet */
+                    *sec = (u64)(u32)mp->spare[lo] + in;
+                    *run = left < rem ? left : rem;
+                    return GZ_OK;
+                }
+                if (o - b < rem) rem = o - b;         /* in place up to the next remapped packet */
             }
         }
         *sec = (u64)pt->start + b;
@@ -168,8 +184,7 @@ static int map_block(udf_rd *u, u32 m, u32 b, u64 *sec, u32 *run, u32 depth)
     }
     case PM_VIRT: {
         if (b >= mp->nvat || mp->vat[b] == 0xffffffffu) return GZ_E_FORMAT;
-        u32 ub = mp->vat[b], n = 1, r2;
-        while (b + n < mp->nvat && mp->vat[b + n] == ub + n && n < (1u << 20)) n++;
+        u32 ub = mp->vat[b], n = mp->vrun[b], r2;
         int rc = map_block(u, (u32)mp->under, ub, sec, &r2, depth + 1);
         if (rc) return rc;
         *run = n < r2 ? n : r2;
@@ -198,14 +213,28 @@ static int map_block(udf_rd *u, u32 m, u32 b, u64 *sec, u32 *run, u32 depth)
     }
 }
 
+/* One unit of mapping work (a run or a mapping step). GZ_E_LIMIT once the budget of the open
+ * is spent (never refunded, so failed or repeated expansions cannot loop); polls cancellation. */
+static int charge(udf_rd *u)
+{
+    if (!u->steps) return GZ_E_LIMIT;
+    if (!(--u->steps & 4095) && gz_cancelled(u->c)) return GZ_E_CANCEL;
+    return GZ_OK;
+}
+
 /* Image runs of one allocation descriptor (len bytes from block b of map m). */
 static int ad_runs(udf_rd *u, xrun_list *l, u64 fpos, u32 m, u32 b, u32 len, u32 type)
 {
-    if (type == 1 || type == 2) return xrun_add(l, fpos, XRUN_ZERO, len);
+    if (type == 1 || type == 2) {
+        int rc = charge(u);
+        return rc ? rc : xrun_add(l, fpos, XRUN_ZERO, len);
+    }
     while (len) {
         u64 sec;
         u32 run;
-        int rc = map_block(u, m, b, &sec, &run, 0);
+        int rc = charge(u);
+        if (rc) return rc;
+        rc = map_block(u, m, b, &sec, &run, 0);
         if (rc) return rc;
         u64 bytes = (u64)run * u->bs;
         if (bytes > len) bytes = len;
@@ -295,6 +324,8 @@ static int fe_runs(udf_rd *u, const udf_fe *fe, const u8 *blk, xrun_list *l, u64
     *len = 0;
     if (adt == 3) {                                        /* data embedded in the entry */
         u64 n = limit < fe->ad_len ? limit : fe->ad_len;
+        int rc = charge(u);
+        if (rc) return rc;
         *len = n;
         return xrun_add(l, 0, fe->phys + fe->ad_off, n);
     }
@@ -466,6 +497,7 @@ static int load_sparing(udf_rd *u, udf_map *mp)
         for (u32 i = 0; i < ne; i++) {
             u32 o = rd32(t + 56 + i * 8), mloc = rd32(t + 60 + i * 8);
             if (o >= 0xfffffff0u) continue;               /* available / defective */
+            if (mp->pkt && o % mp->pkt) continue;         /* not a packet start: never matches */
             mp->spare[c++] = (u64)o << 32 | mloc;
         }
         sort_u64(mp->spare, c);
@@ -489,7 +521,9 @@ static int load_vat(udf_rd *u, udf_map *mp)
         if (fe.ftype != 248 && fe.ftype != 0) continue;
         u->tmp.n = 0;
         u64 len;
-        if (fe_runs(u, &fe, u->blk, &u->tmp, &len) || len < 36 || len > (u64)MAX_VAT * 4 + 4096 || len > u->size) continue;
+        int rc = fe_runs(u, &fe, u->blk, &u->tmp, &len);
+        if (rc == GZ_E_CANCEL) return rc;
+        if (rc || len < 36 || len > (u64)MAX_VAT * 4 + 4096 || len > u->size) continue;
         u8 *d = (u8 *)gz_alloc((size_t)len);
         if (!d) return GZ_E_NOMEM;
         u32 hdr = 0, end = (u32)len;
@@ -504,9 +538,15 @@ static int load_vat(udf_rd *u, udf_map *mp)
         if (!ok) { gz_free(d); continue; }
         mp->nvat = (end - hdr) / 4;
         mp->vat = (u32 *)gz_alloc((size_t)mp->nvat * 4 + 4);
-        if (!mp->vat) { gz_free(d); return GZ_E_NOMEM; }
+        mp->vrun = (u16 *)gz_alloc((size_t)mp->nvat * 2 + 2);
+        if (!mp->vat || !mp->vrun) { gz_free(d); return GZ_E_NOMEM; }
         for (u32 i = 0; i < mp->nvat; i++) mp->vat[i] = rd32(d + hdr + i * 4);
         gz_free(d);
+        for (u32 i = mp->nvat; i-- > 0;) {                 /* contiguous entries, so one step maps them */
+            u32 v = mp->vat[i], k = 1;
+            if (i + 1 < mp->nvat && v < 0xfffffffeu && mp->vat[i + 1] == v + 1) k = mp->vrun[i + 1] + 1u;
+            mp->vrun[i] = (u16)(k < 0xffffu ? k : 0xffffu);
+        }
         return GZ_OK;
     }
     return GZ_E_FORMAT;
@@ -529,7 +569,9 @@ static int load_meta(udf_rd *u, udf_map *mp)
         if (read_fe(u, (u32)mp->under, mp->mloc[k], u->blk, &fe)) continue;
         mp->meta.n = 0;
         u64 len;
-        if (!fe_runs(u, &fe, u->blk, &mp->meta, &len) && mp->meta.n) return GZ_OK;
+        int rc = fe_runs(u, &fe, u->blk, &mp->meta, &len);
+        if (rc == GZ_E_CANCEL) return rc;
+        if (!rc && mp->meta.n) return GZ_OK;
     }
     return GZ_E_FORMAT;
 }
@@ -598,7 +640,7 @@ static int setup_maps(udf_rd *u)
     for (i = 0; i < u->nmaps; i++)
         if (u->maps[i].type == PM_VIRT) {
             int rc = load_vat(u, &u->maps[i]);
-            if (rc == GZ_E_NOMEM) return rc;
+            if (rc == GZ_E_NOMEM || rc == GZ_E_CANCEL) return rc;
             if (rc) u->maps[i].type = PM_NONE;
         }
     for (i = 0; i < u->nmaps; i++)
@@ -611,7 +653,7 @@ static int setup_maps(udf_rd *u)
                     if (u->maps[j].type == PM_PHYS || u->maps[j].type == PM_SPAR) { mp->under = (i32)j; break; }
                 rc = load_meta(u, mp);
             }
-            if (rc == GZ_E_NOMEM) return rc;
+            if (rc == GZ_E_NOMEM || rc == GZ_E_CANCEL) return rc;
             if (rc) mp->type = PM_NONE;
         }
     return GZ_OK;
@@ -665,6 +707,35 @@ static int visit(udf_rd *u, u32 m, u32 b)
     u->vis[h] = key;
     u->vis_n++;
     return 0;
+}
+
+/* Slot of a regular file's entry key ((block << 3 | map) + 1) in the table of files already
+ * expanded: *found = 1 when present (slot->idx = its entry), else a free slot the caller fills.
+ * NULL when the table cannot grow (the file is then expanded again). */
+static fe_seen *file_seen(udf_rd *u, u64 key, int *found)
+{
+    *found = 0;
+    if ((u->fs_n + 1) * 2 > u->fs_cap) {
+        if (u->fs_cap >= (1u << 26)) return 0;
+        u32 nc = u->fs_cap ? u->fs_cap * 2 : 256;
+        fe_seen *nv = (fe_seen *)gz_alloc((size_t)nc * sizeof(fe_seen));
+        if (!nv) return 0;
+        for (u32 i = 0; i < u->fs_cap; i++) {
+            if (!u->fs[i].key) continue;
+            u32 h = (u32)((u->fs[i].key * 0x9E3779B97F4A7C15ull) >> 32) & (nc - 1);
+            while (nv[h].key) h = (h + 1) & (nc - 1);
+            nv[h] = u->fs[i];
+        }
+        gz_free(u->fs);
+        u->fs = nv;
+        u->fs_cap = nc;
+    }
+    u32 h = (u32)((key * 0x9E3779B97F4A7C15ull) >> 32) & (u->fs_cap - 1);
+    while (u->fs[h].key) {
+        if (u->fs[h].key == key) { *found = 1; return &u->fs[h]; }
+        h = (h + 1) & (u->fs_cap - 1);
+    }
+    return &u->fs[h];
 }
 
 static int push_dir(udf_rd *u, u32 m, u32 b, u32 depth, i32 entry)
@@ -770,7 +841,8 @@ static int add_child(udf_rd *u, const dir_item *d, const u8 *f, u32 plen)
         e->is_link = 1;
         u->tmp.n = 0;
         u64 n;
-        if (fe_runs(u, &fe, u->blk, &u->tmp, &n)) return GZ_OK;
+        rc = fe_runs(u, &fe, u->blk, &u->tmp, &n);
+        if (rc) return rc == GZ_E_CANCEL ? rc : GZ_OK;
         if (n > MAX_LINK) n = MAX_LINK;
         u8 *buf = (u8 *)gz_alloc((size_t)n + 1);
         if (!buf) return GZ_E_NOMEM;
@@ -787,14 +859,33 @@ static int add_child(udf_rd *u, const dir_item *d, const u8 *f, u32 plen)
         }
         return GZ_OK;
     }
-    /* regular file (and anything else with data) */
+    /* regular file (and anything else with data); further FIDs of the same file entry (hard
+     * links) share the runs of the first one instead of expanding them again */
+    int found;
+    u64 key = ((fe.phys / u->bs) << 3 | fe.m) + 1;
+    fe_seen *fs = file_seen(u, key, &found);
+    if (found) {
+        const gz_entry *f0 = ent(u, fs->idx);
+        e->usize = f0->usize;
+        e->csize = f0->csize;
+        e->off = f0->off;
+        e->aux = f0->aux;
+        e->aux32 = f0->aux32;
+        e->flags = f0->flags;
+        return GZ_OK;
+    }
+    if (fs) { fs->key = key; fs->idx = idx; u->fs_n++; }
     xrun_list *rl = &u->p->runs;
     u32 start = rl->n;
     u64 n;
     rc = fe_runs(u, &fe, u->blk, rl, &n);
     e = ent(u, idx);
-    if (rc == GZ_E_NOMEM) return rc;
-    if (rc) { rl->n = start; e->flags = F_BAD; return GZ_OK; }
+    if (rc == GZ_E_CANCEL) return rc;
+    if (rc) {                                              /* listed, fails to extract */
+        rl->n = start;
+        e->flags = rc == GZ_E_LIMIT || rc == GZ_E_NOMEM ? F_LIMIT : F_BAD;
+        return GZ_OK;
+    }
     e->usize = e->csize = n;
     if (rl->n == start) return GZ_OK;                      /* empty */
     if (rl->n == start + 1 && rl->r[start].off != XRUN_ZERO) {
@@ -815,7 +906,7 @@ static int scan_dir(udf_rd *u, const dir_item *d)
     u->tmp.n = 0;
     u64 len;
     int rc = fe_runs(u, &fe, u->blk, &u->tmp, &len);
-    if (rc) return rc == GZ_E_NOMEM ? rc : GZ_OK;
+    if (rc) return rc == GZ_E_NOMEM || rc == GZ_E_CANCEL ? rc : GZ_OK;
     if (len > MAX_DIR) return GZ_OK;
     if (len > u->budget) return GZ_E_LIMIT;
     u->budget -= len;
@@ -860,6 +951,7 @@ static void free_maps(udf_rd *u)
     for (u32 i = 0; i < MAX_MAPS; i++) {
         gz_free(u->maps[i].spare);
         gz_free(u->maps[i].vat);
+        gz_free(u->maps[i].vrun);
         gz_free(u->maps[i].meta.r);
     }
     __builtin_memset(u->maps, 0, sizeof u->maps);
@@ -904,6 +996,7 @@ static int udf_open(gz_archive *a, gz_src *s, const gz_open_opts *o, gz_ctx *c)
     u->bs = ss;
     u->nsec = s->size / ss > 0xffffffffu ? 0xffffffffu : (u32)(s->size / ss);
     u->budget = 2 * s->size + (64u << 20);
+    u->steps = xrun_budget(s->size);
     u->lvd = (u8 *)gz_alloc(ss);
     u->blk = (u8 *)gz_alloc(ss);
     u->blk2 = (u8 *)gz_alloc(ss);
@@ -914,7 +1007,7 @@ static int udf_open(gz_archive *a, gz_src *s, const gz_open_opts *o, gz_ctx *c)
     u->p = p;
 
     rc = try_volume(u, vds[0], vds[1]);
-    if (rc && rc != GZ_E_NOMEM) rc = try_volume(u, vds[2], vds[3]);
+    if (rc && rc != GZ_E_NOMEM && rc != GZ_E_CANCEL) rc = try_volume(u, vds[2], vds[3]);
     if (rc) goto out;
     gz_arc_set_type(a, "UDF");
 
@@ -943,6 +1036,7 @@ out:
     gz_free(u->dbuf);
     gz_free(u->tmp.r);
     gz_free(u->vis);
+    gz_free(u->fs);
     gz_free(u->q);
     gz_free(u);
     return rc;
@@ -953,7 +1047,7 @@ out:
 static gz_src *udf_view(gz_archive *a, gz_src *s, u32 idx)
 {
     gz_entry *e = &a->e[idx];
-    if (e->is_dir || e->is_link || (e->flags & F_BAD)) return 0;
+    if (e->is_dir || e->is_link || (e->flags & (F_BAD | F_LIMIT))) return 0;
     if (!(e->flags & F_MULTI)) return gz_src_sub(s, e->off, e->usize);
     udf_priv *p = (udf_priv *)a->priv;
     if (e->aux + e->aux32 > p->runs.n) return 0;
@@ -964,6 +1058,7 @@ static int udf_extract(gz_archive *a, gz_src *s, u32 idx, gz_out *out, gz_ctx *c
 {
     gz_entry *e = &a->e[idx];
     if (e->flags & F_BAD) return GZ_E_FORMAT;
+    if (e->flags & F_LIMIT) return GZ_E_LIMIT;
     if (!(e->flags & F_MULTI) || e->is_dir || e->is_link) return gz_extract_stored(a, s, idx, e->off, out, c);
     gz_src *v = udf_view(a, s, idx);
     if (!v) return GZ_E_NOMEM;

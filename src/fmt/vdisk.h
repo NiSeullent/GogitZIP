@@ -67,12 +67,20 @@ int gz_vd_add_disk(gz_archive *a, const gz_open_opts *o, u64 vsize, u64 csize, g
 int gz_vd_extract(gz_archive *a, gz_src *s, u32 idx, gz_out *out, gz_ctx *c);
 
 /* Open a file referenced by the image (extent, parent) through o->open_volume.
- * name: UTF-8 (or Latin-1) bytes, relative to the image's directory or absolute
- * (then the base name next to the image is tried as well). The source is kept
- * in a->vols and freed with the archive. GZ_E_VOLUME when it cannot be opened. */
+ * name: UTF-8 (or Latin-1) bytes. Only names that stay inside the image's folder are
+ * opened (relative, ".." never climbing above it, no ':' and no DOS device names); for
+ * absolute, UNC, drive or escaping names only the base name next to the image is tried.
+ * Nothing is opened for an image without a file name or one inside another archive
+ * (a->parent). The source is kept in a->vols and freed with the archive. GZ_E_VOLUME
+ * when it cannot be opened. */
 int gz_vd_open_file(gz_archive *a, const gz_open_opts *o, const u8 *name, u32 len, gz_src **out);
 /* Same with a UTF-16 name. */
 int gz_vd_open_file16(gz_archive *a, const gz_open_opts *o, const gzch *name, u32 len, gz_src **out);
+/* Same, resolved against the folder of base (the path of the image holding the reference,
+ * e.g. a differencing parent; NULL = o->file_name). *opened (optional) receives the path
+ * that was opened (gz_free it), against which that file's own references resolve. */
+int gz_vd_open_file16_at(gz_archive *a, const gz_open_opts *o, const gzch *base, const gzch *name, u32 len,
+                         gz_src **out, gzch **opened);
 
 /* Store a short ASCII note (n bytes) as the archive comment (e.g. "log not replayed"). */
 void gz_vd_note(gz_archive *a, const char *text, u32 n);

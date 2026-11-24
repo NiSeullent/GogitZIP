@@ -5,6 +5,10 @@
  *   xrun list        file data described as runs of image bytes or zeros,
  *                    exposed as a random-access gz_src (multi-extent, sparse,
  *                    interleaved and remapped files)
+ *
+ * Run lists are filled from hostile metadata: the readers charge every run they
+ * build to a budget that grows with the image size (XRUN_BUDGET), so a small image
+ * cannot make them build millions of runs, and XRUN_MAX caps the list itself.
  */
 #ifndef GZ_ISOUDF_H
 #define GZ_ISOUDF_H
@@ -34,6 +38,11 @@ static inline u64 isoudf_civil(i64 y, u32 mo, u32 d, u32 h, u32 mi, u32 s, i32 t
 /* ---------------- runs of file data ---------------- */
 
 #define XRUN_ZERO (~(u64)0)          /* run reads as zeros (sparse / unrecorded) */
+#define XRUN_MAX  (1u << 24)          /* runs in one list (and so in one file's view) */
+
+/* Runs (mapping steps) one open may build: 4 per 2 KiB of image + a fixed allowance.
+ * Real images need about one run per fragment, i.e. far less. */
+static inline u64 xrun_budget(u64 image_size) { return (image_size >> 9) + (1u << 16); }
 
 typedef struct { u64 fpos, off, len; } xrun;   /* file position, image offset, length */
 
@@ -52,7 +61,7 @@ static inline int xrun_add(xrun_list *l, u64 fpos, u64 off, u64 len)
         }
     }
     if (l->n == l->cap) {
-        if (l->cap >= (1u << 26)) return GZ_E_LIMIT;
+        if (l->cap >= XRUN_MAX) return GZ_E_LIMIT;
         u32 nc = l->cap ? l->cap * 2 : 64;
         xrun *nr = (xrun *)gz_realloc(l->r, (size_t)nc * sizeof(xrun));
         if (!nr) return GZ_E_NOMEM;
@@ -103,7 +112,7 @@ static inline void xrun_free(gz_src *s) { gz_free(s); }
 /* View of runs r[0..n) (copied) over parent; size = total length of the runs. */
 static inline gz_src *xrun_view(gz_src *parent, const xrun *r, u32 n, u64 size)
 {
-    if (!n || n > (1u << 24)) return 0;
+    if (!n || n > XRUN_MAX) return 0;
     xrun_src *v = (xrun_src *)gz_alloc(sizeof(xrun_src) + (size_t)n * sizeof(xrun));
     if (!v) return 0;
     __builtin_memcpy(v->r, r, (size_t)n * sizeof(xrun));

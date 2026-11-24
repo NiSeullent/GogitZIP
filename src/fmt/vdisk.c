@@ -176,50 +176,141 @@ int gz_vd_extract(gz_archive *a, gz_src *s, u32 idx, gz_out *out, gz_ctx *c)
 
 /* ---------------- referenced files ---------------- */
 
-/* dir + name; separators in name follow the style of dir ('\\' only if dir uses it alone) */
-static int try_open(const gz_open_opts *o, const gzch *dir, u32 dn, const gzch *name, u32 len, gz_src **out)
+/* Names inside images are hostile: a descriptor or a parent locator may name any file the
+ * user can read ("/etc/passwd", "..\..\secret") or, on Windows, a UNC path that makes the
+ * machine authenticate to a remote server as soon as the image is listed. Referenced files
+ * are therefore only opened inside the folder of the image the user opened (its subfolders
+ * included): names are resolved lexically against the folder of the image that holds the
+ * reference, and anything absolute or climbing out of that tree is reduced to its base name
+ * next to the referencing image. */
+
+/* CON, PRN, AUX, NUL, COM0-9, LPT0-9 (also with superscript digits), CONIN$, CONOUT$,
+ * CLOCK$, with any extension: Windows opens the device whatever the folder. */
+static int is_dos_device(const gzch *c, u32 n)
 {
-    gzch *p = (gzch *)gz_alloc(((size_t)dn + len + 1) * sizeof(gzch));
-    if (!p) return GZ_E_NOMEM;
-    gzch sep = '/';
-    const gzch *fn = o->file_name;
-    if (fn) {
-        int fwd = 0, back = 0;
-        for (u32 i = 0; fn[i] && i < 32768; i++) { fwd |= fn[i] == '/'; back |= fn[i] == '\\'; }
-        if (back && !fwd) sep = '\\';
+    u32 k = 0;
+    while (k < n && c[k] != '.') k++;
+    while (k && c[k - 1] == ' ') k--;
+    if (k < 3 || k > 7) return 0;
+    char w[8];
+    for (u32 i = 0; i < k; i++) {
+        u32 ch = c[i];
+        if (ch == 0xB9) ch = '1';
+        else if (ch == 0xB2 || ch == 0xB3) ch = '2' + (ch - 0xB2);
+        if (ch >= 'a' && ch <= 'z') ch -= 32;
+        if (ch >= 0x80) return 0;
+        w[i] = (char)ch;
     }
-    for (u32 i = 0; i < dn; i++) p[i] = dir[i];
-    for (u32 i = 0; i < len; i++) p[dn + i] = is_sep(name[i]) ? sep : name[i];
-    p[dn + len] = 0;
-    *out = 0;
-    int r = o->open_volume(o->user, p, out);
-    gz_free(p);
-    if (!r && !*out) r = GZ_E_VOLUME;
-    return r;
+    if (k == 3)
+        return !__builtin_memcmp(w, "CON", 3) || !__builtin_memcmp(w, "PRN", 3) || !__builtin_memcmp(w, "AUX", 3) ||
+               !__builtin_memcmp(w, "NUL", 3);
+    if (k == 4)
+        return (!__builtin_memcmp(w, "COM", 3) || !__builtin_memcmp(w, "LPT", 3)) && w[3] >= '0' && w[3] <= '9';
+    if (k == 6) return !__builtin_memcmp(w, "CONIN$", 6) || !__builtin_memcmp(w, "CLOCK$", 6);
+    return k == 7 && !__builtin_memcmp(w, "CONOUT$", 7);
 }
 
-int gz_vd_open_file16(gz_archive *a, const gz_open_opts *o, const gzch *name, u32 len, gz_src **out)
+/* Append the components of name (len units) to the path p[root..*pos) (components joined by
+ * sep, no leading or trailing separator), resolving "." and "..". 0 when name is absolute
+ * (a separator first also covers UNC and \\?\ or \\.\ device paths), when ".." climbs above
+ * root, or when a component holds ':' (drive letters, drive-relative paths, NTFS streams) or
+ * NUL, is made only of dots and spaces (Windows trims those) or names a DOS device. */
+static int join_inside(gzch *p, u32 root, u32 *pos, const gzch *name, u32 len, gzch sep)
+{
+    if (len && is_sep(name[0])) return 0;
+    for (u32 i = 0; i < len; i++) {
+        u32 s = i, dots = 0, spaces = 0;
+        for (; i < len && !is_sep(name[i]); i++) {
+            if (name[i] == ':' || !name[i]) return 0;
+            dots += name[i] == '.';
+            spaces += name[i] == ' ';
+        }
+        u32 n = i - s;
+        if (!n || (n == 1 && dots == 1)) continue;                 /* "a//b", "./a" */
+        if (n == 2 && dots == 2) {                                 /* drop the last component */
+            if (*pos == root) return 0;
+            while (*pos > root && p[*pos - 1] != sep) (*pos)--;
+            if (*pos > root) (*pos)--;
+            continue;
+        }
+        if (dots + spaces == n || is_dos_device(name + s, n)) return 0;
+        if (*pos > root) p[(*pos)++] = sep;
+        for (u32 k = s; k < i; k++) p[(*pos)++] = name[k];
+    }
+    return 1;
+}
+
+/* The last component of name is a file name (not empty, "." or ".."). */
+static int last_regular(const gzch *name, u32 len)
+{
+    u32 s = len;
+    while (s && !is_sep(name[s - 1])) s--;
+    u32 n = len - s;
+    return n && !(n == 1 && name[s] == '.') && !(n == 2 && name[s] == '.' && name[s + 1] == '.');
+}
+
+int gz_vd_open_file16_at(gz_archive *a, const gz_open_opts *o, const gzch *base, const gzch *name, u32 len,
+                         gz_src **out, gzch **opened)
 {
     *out = 0;
-    if (!o || !o->open_volume || !len) return GZ_E_VOLUME;
+    if (opened) *opened = 0;
+    /* no image path, or an image inside another archive: no folder to resolve names in */
+    const gzch *top = o ? o->file_name : 0;
+    if (!o || !o->open_volume || !top || !top[0] || a->parent || !len || len > 32768) return GZ_E_VOLUME;
     if (a->nvols >= GZ_VD_MAX_FILES) return GZ_E_LIMIT;
     gz_src **nv = (gz_src **)gz_realloc(a->vols, ((size_t)a->nvols + 1) * sizeof(gz_src *));
     if (!nv) return GZ_E_NOMEM;
     a->vols = nv;
-    const gzch *fn = o->file_name;
-    u32 dn = 0;
-    if (fn) for (u32 i = 0; fn[i] && i < 32768; i++) if (is_sep(fn[i])) dn = i + 1;
-    u32 base = 0;
-    for (u32 i = 0; i < len; i++) if (is_sep(name[i])) base = i + 1;
-    int abs = is_sep(name[0]) || (len > 2 && name[1] == ':' && is_sep(name[2]));
+    /* root = folder of the opened image; separators of the result follow its style */
+    u32 root = 0, tn = 0;
+    int fwd = 0, back = 0;
+    for (; top[tn] && tn < 32768; tn++) {
+        if (is_sep(top[tn])) root = tn + 1;
+        fwd |= top[tn] == '/';
+        back |= top[tn] == '\\';
+    }
+    gzch sep = back && !fwd ? '\\' : '/';
+    /* folder of the referencing image relative to root (base: a path returned in *opened) */
+    const gzch *rel = 0;
+    u32 rn = 0;
+    if (base) {
+        u32 bn = 0;
+        while (base[bn] && bn < 65536) bn++;
+        for (u32 i = 0; i < root; i++) if (bn <= root || base[i] != top[i]) return GZ_E_VOLUME;
+        rel = base + root;
+        for (u32 i = root; i < bn; i++) if (is_sep(base[i])) rn = i + 1 - root;
+    }
+    gzch *p = (gzch *)gz_alloc(((size_t)root + rn + len + 2) * sizeof(gzch));
+    if (!p) return GZ_E_NOMEM;
+    for (u32 i = 0; i < root; i++) p[i] = top[i];
+    u32 pos = root;
+    join_inside(p, root, &pos, rel, rn, sep);              /* built by us: always inside */
+    u32 at = pos;
+    if (!last_regular(name, len) || !join_inside(p, root, &pos, name, len, sep)) {
+        /* absolute, UNC, drive or escaping name: only its base name next to the image */
+        u32 b = 0;
+        for (u32 i = 0; i < len; i++) if (is_sep(name[i]) || name[i] == ':') b = i + 1;
+        pos = at;
+        if (!last_regular(name + b, len - b) || !join_inside(p, root, &pos, name + b, len - b, sep)) {
+            gz_free(p);
+            return GZ_E_VOLUME;
+        }
+    }
+    p[pos] = 0;
     gz_src *s = 0;
-    int r = abs ? try_open(o, 0, 0, name, len, &s) : try_open(o, fn, dn, name, len, &s);
-    if (r && r != GZ_E_CANCEL && r != GZ_E_NOMEM && abs && base < len)
-        r = try_open(o, fn, dn, name + base, len - base, &s);
+    int r = o->open_volume(o->user, p, &s);
+    if (!r && !s) r = GZ_E_VOLUME;
+    if (!r && opened) *opened = p;
+    else gz_free(p);
     if (r) return (r == GZ_E_CANCEL || r == GZ_E_NOMEM) ? r : GZ_E_VOLUME;
     a->vols[a->nvols++] = s;
     *out = s;
     return GZ_OK;
+}
+
+int gz_vd_open_file16(gz_archive *a, const gz_open_opts *o, const gzch *name, u32 len, gz_src **out)
+{
+    return gz_vd_open_file16_at(a, o, 0, name, len, out, 0);
 }
 
 int gz_vd_open_file(gz_archive *a, const gz_open_opts *o, const u8 *name, u32 len, gz_src **out)
