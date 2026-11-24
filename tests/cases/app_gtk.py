@@ -75,7 +75,8 @@ class Session:
 
     def __init__(self, t, app, work):
         self.t, self.app, self.work = t, app, work
-        self.x = subprocess.Popen(["Xvfb", "-displayfd", "1", "-screen", "0", "1400x900x24", "-nolisten", "tcp"],
+        self.x = subprocess.Popen(["Xvfb", "-displayfd", "1", "-screen", "0", "1400x900x24", "-nolisten", "tcp",
+                                   "-noreset"],  # a reset after the last client leaves refuses the next app
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         line = b""
         end = time.time() + 20
