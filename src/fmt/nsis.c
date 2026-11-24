@@ -39,7 +39,24 @@
 #define PATCH_MAX   (16u << 20)          /* uninstaller patch data                    */
 #define DUP_MAX     (64u << 20)          /* solid: buffer shared data up to this size */
 #define STR_MAX     32768u               /* longest decoded string (units)            */
-#define POOL_MAX    (1u << 26)           /* all names + prefixes (units)              */
+#define STR_SCAN    (4u * STR_MAX)       /* string table units read for one string    */
+#define POOL_MAX    (1u << 26)           /* all names + prefixes (units, at most names_max) */
+/* String work of one header parse: units read + written by the string decoder and
+ * copied around. Every command can name the same huge string, so work that does not
+ * end in the pool (names, prefixes: POOL_MAX) is budgeted: WORK_MIN + WORK_RATIO
+ * units per header byte, plus WORK_KEPT units per pool unit. */
+#define WORK_MIN    (16u << 20)
+#define WORK_RATIO  4u
+#define WORK_KEPT   4u
+/* names_max, bytes of all full entry names (the SetOutPath prefix is repeated in
+ * every name): NAMES_MIN + NAMES_RATIO bytes per header byte, at most NAMES_CAP */
+#define NAMES_MIN   (16u << 20)
+#define NAMES_RATIO 16u
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#  define NAMES_CAP ((u64)1 << 30)
+#else
+#  define NAMES_CAP ((u64)256 << 20)
+#endif
 #define CMD_SIZE    28u
 #define MAX_CMDS    (1u << 25)
 #define COMP_FLAG   0x80000000u
@@ -330,6 +347,9 @@ typedef struct {
     u32 *pfx; u32 npfx, cappfx;/* prefix table: off, len   */
     wbuf cur, spec, tmp;       /* SetOutPath prefix, $_OUTDIR copy, scratch */
     i32 cur_idx;               /* prefix table index of cur (-1 = not stored yet) */
+    u32 *rank;                 /* prefix table index -> order of its text (equal text, equal rank) */
+    u64 work, work_max;        /* string units handled / budget without the pool allowance */
+    u64 names_max;             /* see NAMES_MIN; also caps the pool (units) */
     int err;
 } ns_parse;
 
@@ -431,15 +451,17 @@ static NS_COLD void put_shell(const ns_parse *P, u32 i1, u32 i2, wbuf *o)
     wb_put(o, ']');
 }
 
-/* Append the string at char index pos (negative: language string) to o. */
-static NS_COLD void ns_string(const ns_parse *P, u32 pos, wbuf *o)
+/* Decode the string at pos (< nchars) into o; returns the index after the last unit
+ * read. Stops once o holds STR_MAX units (the rest would be dropped anyway) or
+ * STR_SCAN units were read: a string that long cannot fit (<= 3 units per output
+ * unit), so the cost of one call does not depend on the string table size. */
+static NS_COLD u32 str_walk(const ns_parse *P, u32 pos, wbuf *o)
 {
-    if ((i32)pos < 0) { put_lang(o, ~pos); return; }
-    if (pos >= P->nchars) { wb_ascii(o, "$_ERROR_STR_"); return; }
     u32 i = pos, n = P->nchars;
+    if (n - pos > STR_SCAN) n = pos + STR_SCAN;
     if (!P->uni) {
         int n3 = P->type == NT_NSIS3;
-        while (i < n) {
+        while (i < n && o->n < STR_MAX) {
             u32 c = P->st[i++], code = 0;
             if (!c) break;
             if (n3) { if (c <= 4) code = c; }
@@ -456,10 +478,10 @@ static NS_COLD void ns_string(const ns_parse *P, u32 pos, wbuf *o)
                 if (code == 3) put_var(P, v, o); else put_lang(o, v);
             }
         }
-        return;
+        return i;
     }
     if (P->type >= NT_PARK1) {
-        while (i < n) {
+        while (i < n && o->n < STR_MAX) {
             u32 c = ch_at(P, i++);
             if (!c) break;
             if (c >= 0xE000 && c <= 0xE003) {
@@ -475,9 +497,9 @@ static NS_COLD void ns_string(const ns_parse *P, u32 pos, wbuf *o)
             }
             wb_put(o, c);
         }
-        return;
+        return i;
     }
-    while (i < n) {                                      /* NSIS 3 Unicode */
+    while (i < n && o->n < STR_MAX) {                    /* NSIS 3 Unicode */
         u32 c = ch_at(P, i++);
         if (c > 4) { wb_put(o, c); continue; }
         if (!c) break;
@@ -490,6 +512,30 @@ static NS_COLD void ns_string(const ns_parse *P, u32 pos, wbuf *o)
             if (c == 3) put_var(P, v, o); else put_lang(o, v);
         }
     }
+    return i;
+}
+
+/* Append the string at char index pos (negative: language string) to o. */
+static NS_COLD void ns_string(ns_parse *P, u32 pos, wbuf *o)
+{
+    u32 n0 = o->n;
+    if ((i32)pos < 0) put_lang(o, ~pos);
+    else if (pos >= P->nchars) wb_ascii(o, "$_ERROR_STR_");
+    else P->work += str_walk(P, pos, o) - pos;
+    P->work += o->n - n0 + 1;
+}
+
+/* the string work exceeds the budget (see WORK_MIN) */
+static NS_COLD int over_budget(const ns_parse *P)
+{
+    return P->work > P->work_max + (u64)P->pn * WORK_KEPT;
+}
+
+/* copy n units to b (string work) */
+static NS_COLD void wb_copy_w(ns_parse *P, wbuf *b, const u16 *s, u32 n)
+{
+    P->work += n;
+    wb_copy(b, s, n);
 }
 
 /* variable index if the string at pos starts with a variable code, else -1 */
@@ -545,16 +591,20 @@ static NS_COLD int good_string(const ns_parse *P, u32 pos)
     return c == 0 || c == '\\';
 }
 
-static NS_COLD int same_strings(const ns_parse *P, u32 a, u32 b)
+/* the strings at a and b are equal (compared up to STR_MAX units: names are cut there) */
+static NS_COLD int same_strings(ns_parse *P, u32 a, u32 b)
 {
     if (a == b) return 1;
     if (a >= P->nchars || b >= P->nchars) return 0;
-    for (u32 i = 0; a + i < P->nchars && b + i < P->nchars; i++) {
+    int same = 0;
+    u32 i = 0;
+    for (; i < STR_MAX && a + i < P->nchars && b + i < P->nchars; i++) {
         u32 x = ch_at(P, a + i);
-        if (x != ch_at(P, b + i)) return 0;
-        if (!x) return 1;
+        if (x != ch_at(P, b + i)) break;
+        if (!x) { same = 1; break; }
     }
-    return 0;
+    P->work += (u64)i + 1;
+    return same;
 }
 
 /* ---- command layout: NSIS 2 / 3, Park 1..3, with or without EW_LOG ---- */
@@ -639,7 +689,7 @@ static NS_COLD void detect_type(ns_parse *P, const u8 *cmds, u32 num)
         /* Park's forks insert commands before EW_WRITEUNINSTALLER: find where its
          * "$INSTDIR\" + name alternative path parameter sits */
         u32 mask = 0, ins_max = P->uni ? 4 : 2;
-        for (k = 0, p = cmds; k < num; k++, p += CMD_SIZE) {
+        for (k = 0, p = cmds; k < num && !over_budget(P); k++, p += CMD_SIZE) {
             u32 raw = rd32(p);
             if (raw < EW_WRITEUNINSTALLER || raw > EW_WRITEUNINSTALLER + ins_max) continue;
             u32 p0 = rd32(p + 4), p3 = rd32(p + 16), skip;
@@ -686,7 +736,7 @@ static NS_COLD void detect_type(ns_parse *P, const u8 *cmds, u32 num)
 
 static NS_COLD int pool_add(ns_parse *P, const u16 *s, u32 n, u32 *off)
 {
-    if (n > POOL_MAX - P->pn) return GZ_E_LIMIT;
+    if (n > GZ_MIN((u64)POOL_MAX, P->names_max) - P->pn) return GZ_E_LIMIT;
     if (P->pn + n > P->pcap) {
         u32 nc = P->pcap ? P->pcap : 65536;
         while (nc < P->pn + n) nc *= 2;
@@ -698,6 +748,7 @@ static NS_COLD int pool_add(ns_parse *P, const u16 *s, u32 n, u32 *off)
     if (n) __builtin_memcpy(P->pool + P->pn, s, (size_t)n * 2);
     *off = P->pn;
     P->pn += n;
+    P->work += n;
     return GZ_OK;
 }
 
@@ -761,7 +812,7 @@ static NS_COLD int set_name(ns_parse *P, ns_item *it, u32 pos)
     return abs ? GZ_OK : cur_prefix(P, &it->prefix);
 }
 
-static NS_COLD int read_entries(ns_parse *P, const u8 *cmds, u32 num)
+static NS_COLD int read_entries(ns_parse *P, const u8 *cmds, u32 num, gz_ctx *c)
 {
     u32 spec_var = P->n225 ? V_SPEC_OUTDIR_225 : V_SPEC_OUTDIR;
     P->cur.n = 0;
@@ -770,6 +821,8 @@ static NS_COLD int read_entries(ns_parse *P, const u8 *cmds, u32 num)
     P->spec.n = 0;
     const u8 *p = cmds;
     for (u32 k = 0; k < num; k++, p += CMD_SIZE) {
+        if (over_budget(P)) return GZ_E_LIMIT;
+        if (!(k & 4095) && gz_cancelled(c)) return GZ_E_CANCEL;
         u32 id = get_cmd(P, rd32(p)), pr[6];
         for (int i = 0; i < 6; i++) pr[i] = rd32(p + 4 + 4 * i);
         int r = GZ_OK;
@@ -783,18 +836,18 @@ static NS_COLD int read_entries(ns_parse *P, const u8 *cmds, u32 num)
             ns_string(P, par, &P->tmp);
             if (v == (i32)spec_var) {
                 P->cur.n = 0;
-                wb_copy(&P->cur, P->spec.p, P->spec.n);
+                wb_copy_w(P, &P->cur, P->spec.p, P->spec.n);
             } else if (v != V_OUTDIR) {
                 P->cur.n = 0;
             }
-            wb_copy(&P->cur, P->tmp.p, P->tmp.n);  /* $OUTDIR: relative to the last one */
+            wb_copy_w(P, &P->cur, P->tmp.p, P->tmp.n);  /* $OUTDIR: relative to the last one */
             P->cur_idx = -1;
             break;
         }
         case EW_ASSIGNVAR:
             if (pr[0] == spec_var) {              /* StrCpy $_OUTDIR $OUTDIR */
                 P->spec.n = 0;
-                if (is_var_str(P, pr[1], V_OUTDIR) && !pr[2] && !pr[3]) wb_copy(&P->spec, P->cur.p, P->cur.n);
+                if (is_var_str(P, pr[1], V_OUTDIR) && !pr[2] && !pr[3]) wb_copy_w(P, &P->spec, P->cur.p, P->cur.n);
             }
             break;
         case EW_EXTRACTFILE: {
@@ -853,43 +906,71 @@ static NS_COLD int cmp_units(const u16 *a, u32 an, const u16 *b, u32 bn)
     return an == bn ? 0 : an < bn ? -1 : 1;
 }
 
-static NS_COLD int cmp_prefix(const ns_parse *P, i32 x, i32 y)
+typedef int (*ns_cmp_fn)(const ns_parse *P, u32 x, u32 y);
+
+/* stable bottom-up merge sort of n indices */
+static NS_COLD int sort_ix(const ns_parse *P, u32 *ix, u32 n, ns_cmp_fn cmp, gz_ctx *c)
+{
+    u32 *tmp = (u32 *)gz_alloc((size_t)n * sizeof(u32) + 4);
+    if (!tmp) return GZ_E_NOMEM;
+    u32 *src = ix, *dst = tmp, done = 0;
+    int r = GZ_OK;
+    for (u32 w = 1; w < n && !r; w *= 2) {
+        for (u32 lo = 0; lo < n; lo += 2 * w) {
+            u32 mid = GZ_MIN(lo + w, n), hi = GZ_MIN(lo + 2 * w, n), i = lo, j = mid, o = lo;
+            while (i < mid && j < hi)
+                dst[o++] = cmp(P, src[j], src[i]) < 0 ? src[j++] : src[i++];
+            while (i < mid) dst[o++] = src[i++];
+            while (j < hi) dst[o++] = src[j++];
+            if ((done += hi - lo) >= 65536) {
+                done = 0;
+                if (gz_cancelled(c)) { r = GZ_E_CANCEL; break; }
+            }
+        }
+        u32 *t = src; src = dst; dst = t;
+    }
+    if (!r && src != ix) __builtin_memcpy(ix, src, (size_t)n * sizeof(u32));
+    gz_free(tmp);
+    return r;
+}
+
+static NS_COLD int cmp_prefix_text(const ns_parse *P, u32 x, u32 y)
 {
     return cmp_units(P->pool + P->pfx[2 * x], P->pfx[2 * x + 1], P->pool + P->pfx[2 * y], P->pfx[2 * y + 1]);
 }
 
-/* 7-Zip's order: data position, then prefix (none first), then name */
-static NS_COLD int cmp_item(const ns_parse *P, const ns_item *a, const ns_item *b)
+/* P->rank: the order of the prefix texts, equal texts share a rank. Items then
+ * compare prefixes in O(1): sorting them by text would cost a whole prefix (up to
+ * STR_MAX units) per comparison. */
+static NS_COLD int rank_prefixes(ns_parse *P, gz_ctx *c)
 {
+    u32 n = P->npfx;
+    if (!n) return GZ_OK;
+    u32 *ix = (u32 *)gz_alloc((size_t)n * sizeof(u32));
+    P->rank = (u32 *)gz_alloc((size_t)n * sizeof(u32));
+    if (!ix || !P->rank) { gz_free(ix); return GZ_E_NOMEM; }
+    for (u32 i = 0; i < n; i++) ix[i] = i;
+    int r = sort_ix(P, ix, n, cmp_prefix_text, c);
+    for (u32 k = 0, rk = 0; !r && k < n; k++) {
+        if (k && cmp_prefix_text(P, ix[k - 1], ix[k])) rk++;
+        P->rank[ix[k]] = rk;
+    }
+    gz_free(ix);
+    return r;
+}
+
+/* 7-Zip's order: data position, then prefix (none first), then name */
+static NS_COLD int cmp_item(const ns_parse *P, u32 x, u32 y)
+{
+    const ns_item *a = &P->it[x], *b = &P->it[y];
     if (a->pos != b->pos) return a->pos < b->pos ? -1 : 1;
     if (a->prefix != b->prefix) {
         if (a->prefix < 0) return -1;
         if (b->prefix < 0) return 1;
-        int c = cmp_prefix(P, a->prefix, b->prefix);
-        if (c) return c;
+        u32 ra = P->rank[a->prefix], rb = P->rank[b->prefix];
+        if (ra != rb) return ra < rb ? -1 : 1;
     }
     return cmp_units(P->pool + a->noff, a->nlen, P->pool + b->noff, b->nlen);
-}
-
-/* stable bottom-up merge sort of item indices */
-static NS_COLD int sort_items(const ns_parse *P, u32 *ix, u32 n)
-{
-    u32 *tmp = (u32 *)gz_alloc((size_t)n * sizeof(u32) + 4);
-    if (!tmp) return GZ_E_NOMEM;
-    u32 *src = ix, *dst = tmp;
-    for (u32 w = 1; w < n; w *= 2) {
-        for (u32 lo = 0; lo < n; lo += 2 * w) {
-            u32 mid = GZ_MIN(lo + w, n), hi = GZ_MIN(lo + 2 * w, n), i = lo, j = mid, o = lo;
-            while (i < mid && j < hi)
-                dst[o++] = cmp_item(P, &P->it[src[j]], &P->it[src[i]]) < 0 ? src[j++] : src[i++];
-            while (i < mid) dst[o++] = src[i++];
-            while (j < hi) dst[o++] = src[j++];
-        }
-        u32 *t = src; src = dst; dst = t;
-    }
-    if (src != ix) __builtin_memcpy(ix, src, (size_t)n * sizeof(u32));
-    gz_free(tmp);
-    return GZ_OK;
 }
 
 static NS_COLD int same_item(const ns_parse *P, const ns_item *a, const ns_item *b)
@@ -898,11 +979,20 @@ static NS_COLD int same_item(const ns_parse *P, const ns_item *a, const ns_item 
     if (cmp_units(P->pool + a->noff, a->nlen, P->pool + b->noff, b->nlen)) return 0;
     if (a->prefix == b->prefix) return 1;
     if (a->prefix < 0 || b->prefix < 0) return 0;
-    return !cmp_prefix(P, a->prefix, b->prefix);
+    return P->rank[a->prefix] == P->rank[b->prefix];
+}
+
+/* units of the prefix kept in an item's full name (cut so that the name fits) */
+static NS_COLD u32 prefix_units(const ns_parse *P, const ns_item *it)
+{
+    if (it->prefix < 0) return 0;
+    u32 pl = P->pfx[2 * it->prefix + 1];
+    if (pl + it->nlen + 6 > STR_MAX) pl = it->nlen + 6 < STR_MAX ? STR_MAX - it->nlen - 6 : 0;  /* keep the name */
+    return pl;
 }
 
 /* Parse the decompressed header: string table, version, commands -> P->it. */
-static NS_COLD int parse_header(ns_parse *P)
+static NS_COLD int parse_header(ns_parse *P, gz_ctx *c)
 {
     const u8 *h = P->h;
     u32 hn = P->hn;
@@ -925,8 +1015,11 @@ static NS_COLD int parse_header(ns_parse *P)
         P->nchars = sts / 2;
     }
     if (ent_num > MAX_CMDS || (u64)ent_num * CMD_SIZE > hn - ent_off) return GZ_E_FORMAT;
+    P->work_max = WORK_MIN + (u64)hn * WORK_RATIO;
+    P->names_max = GZ_MIN(NAMES_CAP, NAMES_MIN + (u64)hn * NAMES_RATIO);
     detect_type(P, h + ent_off, ent_num);
-    return read_entries(P, h + ent_off, ent_num);
+    if (over_budget(P)) return GZ_E_LIMIT;
+    return read_entries(P, h + ent_off, ent_num, c);
 }
 
 static NS_COLD void parse_free(ns_parse *P)
@@ -934,6 +1027,7 @@ static NS_COLD void parse_free(ns_parse *P)
     gz_free(P->it);
     gz_free(P->pool);
     gz_free(P->pfx);
+    gz_free(P->rank);
     gz_free(P->cur.p);
     gz_free(P->spec.p);
     gz_free(P->tmp.p);
@@ -975,8 +1069,7 @@ static NS_COLD int add_entries(gz_archive *a, ns_parse *P, const u32 *ix, u32 n,
         wbuf *t = &P->tmp;
         t->n = 0;
         if (it->prefix >= 0) {
-            u32 po = P->pfx[2 * it->prefix], pl = P->pfx[2 * it->prefix + 1];
-            if (pl + it->nlen + 6 > STR_MAX) pl = it->nlen + 6 < STR_MAX ? STR_MAX - it->nlen - 6 : 0;  /* keep the name */
+            u32 po = P->pfx[2 * it->prefix], pl = prefix_units(P, it);
             wb_copy(t, P->pool + po, pl);
             if (pl && P->pool[po + pl - 1] != '\\') wb_put(t, '\\');
         }
@@ -1165,9 +1258,9 @@ static NS_COLD int ns_open(gz_archive *a, gz_src *s, const gz_open_opts *o, gz_c
         __builtin_memset(&P, 0, sizeof P);
         P.h = hb.p + (g->solid ? 4 : 0);
         P.hn = p->hdr_size;
-        r = parse_header(&P);
+        r = parse_header(&P, c);
         if (r) {
-            if (r == GZ_E_NOMEM || r == GZ_E_LIMIT) { err = r; break; }
+            if (r == GZ_E_NOMEM || r == GZ_E_LIMIT || r == GZ_E_CANCEL) { err = r; break; }
             err = GZ_E_FORMAT;
             continue;
         }
@@ -1189,14 +1282,21 @@ static NS_COLD int ns_open(gz_archive *a, gz_src *s, const gz_open_opts *o, gz_c
     }
     u32 *ix = 0;
     r = GZ_OK;
-    if (P.nit) {
+    /* every name repeats its SetOutPath prefix (up to STR_MAX units): budget the
+     * total before building (and sorting) anything */
+    u64 names = 0;
+    for (u32 i = 0; i < P.nit && names <= P.names_max; i++)
+        names += ((u64)prefix_units(&P, &P.it[i]) + P.it[i].nlen + 16) << P.uni;
+    if (names > P.names_max) r = GZ_E_LIMIT;
+    if (!r && P.nit) {
         ix = (u32 *)gz_alloc((size_t)P.nit * sizeof(u32));
         if (!ix) r = GZ_E_NOMEM;
     }
     u32 n = 0;
+    if (!r) r = rank_prefixes(&P, c);
     if (!r) {
         for (u32 i = 0; i < P.nit; i++) ix[i] = i;
-        r = P.nit ? sort_items(&P, ix, P.nit) : GZ_OK;
+        r = P.nit ? sort_ix(&P, ix, P.nit, cmp_item, c) : GZ_OK;
     }
     if (!r) {
         /* drop exact duplicates (same data, same full name) */

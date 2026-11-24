@@ -59,6 +59,16 @@
 #define MAX_PATH_BYTES  65534u          /* UTF-16LE bytes of a full path             */
 #define MAX_REPARSE     (64u << 10)
 #define TOTAL_META      (2ull << 30)    /* metadata bytes parsed over all images     */
+/* Full paths of all entries (a->raw): every child repeats its parent's path (up to
+ * MAX_PATH_BYTES for ~112 bytes of dentry), so the total is budgeted: NAMES_MIN +
+ * NAMES_RATIO bytes per metadata byte parsed so far, at most NAMES_CAP. */
+#define NAMES_MIN       (16u << 20)
+#define NAMES_RATIO     16u
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#  define NAMES_CAP     (1ull << 30)
+#else
+#  define NAMES_CAP     (512ull << 20)
+#endif
 
 enum { CT_NONE = 0, CT_XPRESS = 1, CT_LZX = 2, CT_LZMS = 3, CT_UNKNOWN = 15 };
 enum { RK_RAW = 0, RK_CHUNKED, RK_SOLID, RK_BAD };
@@ -648,6 +658,7 @@ typedef struct {
     u8 *seen;                       /* dentry / stream entry starts (8-byte units) */
     pend *st; u32 nst, capst;
     u8 *path; u32 pcap;
+    u64 names_max;                  /* cap of a->raw_len (NAMES_MIN) */
 } meta_ctx;
 
 static int seen_test_set(meta_ctx *x, u64 off)
@@ -677,7 +688,7 @@ static int push(meta_ctx *x, u64 off, i32 dir, u32 depth)
 
 static int add_ent(meta_ctx *x, u32 plen, gz_entry **pe)
 {
-    if (x->a->n >= MAX_ENTRIES) return GZ_E_LIMIT;
+    if (x->a->n >= MAX_ENTRIES || x->a->raw_len + plen > x->names_max) return GZ_E_LIMIT;
     return gz_arc_add_named(x->a, x->path, plen, GZ_NE_UTF16LE, pe);
 }
 
@@ -837,8 +848,9 @@ static int read_dir(meta_ctx *x, const pend *pd)
     return GZ_OK;
 }
 
-/* Parse one image's metadata into entries below the folder entry `img` (-1 = root). */
-static int read_image(gz_archive *a, wim_priv *p, gz_ctx *c, const u8 *m, u64 n, i32 img)
+/* Parse one image's metadata into entries below the folder entry `img` (-1 = root).
+ * names_max: limit of a->raw_len. */
+static int read_image(gz_archive *a, wim_priv *p, gz_ctx *c, const u8 *m, u64 n, i32 img, u64 names_max)
 {
     if (n < 8) return GZ_E_FORMAT;
     u64 sec = rd32(m);
@@ -855,6 +867,7 @@ static int read_image(gz_archive *a, wim_priv *p, gz_ctx *c, const u8 *m, u64 n,
     x.m = m;
     x.n = n;
     x.pcap = MAX_PATH_BYTES + 8;
+    x.names_max = names_max;
     x.seen = (u8 *)gz_alloc((size_t)(n >> 6) + 2);
     x.path = (u8 *)gz_alloc(x.pcap + 8);
     int r = (!x.seen || !x.path) ? GZ_E_NOMEM : GZ_OK;
@@ -1071,7 +1084,7 @@ static int wim_open(gz_archive *a, gz_src *s, const gz_open_opts *o, gz_ctx *c)
         if (total_meta > TOTAL_META) { r = GZ_E_LIMIT; goto out; }
         r = read_all(&rd, meta[i], MAX_META, &ms);
         if (!r && !hash_ok(mb, ms.p, ms.n)) r = GZ_E_CRC;
-        if (!r) r = read_image(a, p, c, ms.p, ms.n, img);
+        if (!r) r = read_image(a, p, c, ms.p, ms.n, img, GZ_MIN(NAMES_CAP, NAMES_MIN + total_meta * NAMES_RATIO));
         gz_mem_sink_free(&ms);
         if (r) goto out;
         if (c && c->progress) c->progress(c->progress_user, i + 1, nshow);

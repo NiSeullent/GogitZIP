@@ -182,38 +182,59 @@ static int set_link(gz_archive *a, u32 idx, const u8 *t, u32 n)
     return GZ_OK;
 }
 
+int gz_keyidx_sort(gz_keyidx *v, u32 n)
+{
+    if (n < 2) return GZ_OK;
+    gz_keyidx *tmp = (gz_keyidx *)gz_alloc((size_t)n * sizeof *tmp);
+    if (!tmp) return GZ_E_NOMEM;
+    gz_keyidx *src = v, *dst = tmp;
+    for (u64 w = 1; w < n; w *= 2) {                           /* bottom-up merge sort */
+        for (u64 lo = 0; lo < n; lo += 2 * w) {
+            u32 mid = (u32)GZ_MIN(lo + w, (u64)n), hi = (u32)GZ_MIN(lo + 2 * w, (u64)n), i = (u32)lo, j = mid,
+                o = (u32)lo;
+            while (i < mid && j < hi) dst[o++] = src[j].key < src[i].key ? src[j++] : src[i++];
+            while (i < mid) dst[o++] = src[i++];
+            while (j < hi) dst[o++] = src[j++];
+        }
+        gz_keyidx *t = src; src = dst; dst = t;
+    }
+    if (src != v) __builtin_memcpy(v, src, (size_t)n * sizeof *v);
+    gz_free(tmp);
+    return GZ_OK;
+}
+
 /* Hard links: newc/crc writers store the data with one member of a link group
  * (GNU cpio: the last), the others have size 0. Those become is_link = 2 entries
- * naming the member that holds the data. */
+ * naming the member that holds the data. Groups (equal device + inode, chosen by
+ * the archive) are found by sorting. */
 static int link_fixup(gz_archive *a, u32 first)
 {
     u32 cnt = 0;
     for (u32 i = first; i < a->n; i++) cnt += a->e[i].flags & F_MULTI;
     if (cnt < 2) return GZ_OK;
-    u32 cap = 16;
-    while (cap < cnt * 2) cap <<= 1;
-    u32 *tab = (u32 *)gz_alloc((size_t)cap * sizeof(u32));      /* entry index + 1, 0 = empty */
-    if (!tab) return GZ_E_NOMEM;
-    for (int pass = 0; pass < 2; pass++) {
-        for (u32 i = first; i < a->n; i++) {
-            gz_entry *e = &a->e[i];
-            if (!(e->flags & F_MULTI)) continue;
-            u32 h = (u32)((e->aux * 0x9E3779B97F4A7C15ull) >> 40) & (cap - 1);
-            while (tab[h] && a->e[tab[h] - 1].aux != e->aux) h = (h + 1) & (cap - 1);
-            if (!pass) {
-                if (!tab[h] || e->usize) tab[h] = i + 1;      /* the last member with data */
-                continue;
-            }
-            const gz_entry *d = &a->e[tab[h] - 1];
-            if (d != e && !e->usize && d->usize) {
-                e->is_link = 2;
-                e->link_off = d->raw_off;
-                e->link_len = d->raw_len;
-            }
+    gz_keyidx *v = (gz_keyidx *)gz_alloc((size_t)cnt * sizeof *v);
+    if (!v) return GZ_E_NOMEM;
+    u32 k = 0;
+    for (u32 i = first; i < a->n; i++)
+        if (a->e[i].flags & F_MULTI) { v[k].key = a->e[i].aux; v[k].idx = i; k++; }
+    int r = gz_keyidx_sort(v, cnt);
+    for (u32 g = 0, end; !r && g < cnt; g = end) {
+        for (end = g + 1; end < cnt && v[end].key == v[g].key; end++) {}
+        u32 h = v[g].idx;                                    /* the last member with data */
+        for (u32 j = g; j < end; j++)
+            if (a->e[v[j].idx].usize) h = v[j].idx;
+        const gz_entry *d = &a->e[h];
+        if (!d->usize) continue;
+        for (u32 j = g; j < end; j++) {
+            gz_entry *e = &a->e[v[j].idx];
+            if (e == d || e->usize) continue;
+            e->is_link = 2;
+            e->link_off = d->raw_off;
+            e->link_len = d->raw_len;
         }
     }
-    gz_free(tab);
-    return GZ_OK;
+    gz_free(v);
+    return r;
 }
 
 /* ---------------- push parser ---------------- */

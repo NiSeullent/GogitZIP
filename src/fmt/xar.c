@@ -26,11 +26,22 @@
 #define XAR_DEPTH_MAX 512u           /* XML element nesting                    */
 #define XAR_PATH_MAX  16384u         /* full path of an entry                  */
 #define XAR_NODES_MAX (1u << 21)     /* <file> elements                        */
+/* Full paths of all entries (a->raw): every child repeats its parent's path (up to
+ * XAR_PATH_MAX for ~40 bytes of XML), so the total is budgeted: XAR_NAMES_MIN +
+ * XAR_NAMES_RATIO bytes per TOC byte, at most XAR_NAMES_CAP. */
+#define XAR_NAMES_MIN   (16u << 20)
+#define XAR_NAMES_RATIO 16u
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#  define XAR_NAMES_CAP ((u64)1 << 30)
+#else
+#  define XAR_NAMES_CAP ((u64)256 << 20)
+#endif
 
 enum { EN_NONE = 0, EN_ZLIB, EN_BZIP2, EN_XZ, EN_LZMA, EN_OTHER };
 enum { CK_NONE = 0, CK_SHA1, CK_SHA256 };
 enum { FT_NONE = 0, FT_FILE, FT_DIR, FT_SYMLINK, FT_HARDLINK, FT_OTHER };
-enum { NF_DATA = 1, NF_SIZE = 2, NF_MODE = 4, NF_MTIME = 8, NF_BADPATH = 16, NF_LENGTH = 32, NF_OFFSET = 64 };
+enum { NF_DATA = 1, NF_SIZE = 2, NF_MODE = 4, NF_MTIME = 8, NF_BADPATH = 16, NF_LENGTH = 32, NF_OFFSET = 64,
+       NF_KIDS = 128 };
 enum { X_OTHER = 0, X_XAR, X_TOC, X_FILE, X_NAME, X_TYPE, X_DATA, X_LENGTH, X_OFFSET, X_SIZE,
        X_ENCODING, X_EXCK, X_CHECKSUM, X_MODE, X_MTIME, X_LINK };
 
@@ -508,6 +519,9 @@ static int build_entries(gz_archive *a, xparse *p, u64 heap, xar_priv *pv)
     pv->x = (xent *)gz_alloc((size_t)p->nn * sizeof(xent) + 1);
     if (!tmp || !ent || !pv->x) { gz_free(tmp); gz_free(ent); return GZ_E_NOMEM; }
     int r = GZ_OK;
+    u64 names_max = GZ_MIN(XAR_NAMES_CAP, XAR_NAMES_MIN + (u64)p->n * XAR_NAMES_RATIO);
+    for (u32 i = 0; i < p->nn; i++)
+        if (p->nd[i].parent >= 0) p->nd[p->nd[i].parent].flags |= NF_KIDS;   /* their paths are needed */
     for (u32 i = 0; i < p->nn && !r; i++) {
         xnode *d = &p->nd[i];
         ent[i] = -1;
@@ -517,6 +531,8 @@ static int build_entries(gz_archive *a, xparse *p, u64 heap, xar_priv *pv)
         u64 total = (u64)pl + (pl ? 1 : 0) + d->name_len;
         if (!d->name_len) { d->path_off = par ? par->path_off : 0; d->path_len = pl; continue; }
         if (total > XAR_PATH_MAX) { d->flags |= NF_BADPATH; continue; }
+        if (d->type == FT_OTHER && !(d->flags & NF_KIDS)) continue;   /* devices, fifos, sockets: no entry */
+        if (a->raw_len + total > names_max) { r = GZ_E_LIMIT; break; }
         if (pl) { __builtin_memcpy(tmp, a->raw + par->path_off, pl); tmp[pl] = '/'; }
         __builtin_memcpy(tmp + pl + (pl ? 1 : 0), p->scr + d->name_off, d->name_len);
         if ((r = gz_arc_raw_append(a, tmp, (u32)total, &d->path_off))) break;
@@ -563,34 +579,33 @@ static int build_entries(gz_archive *a, xparse *p, u64 heap, xar_priv *pv)
             }
         }
     }
-    /* hard links: <type link="N">hardlink</type> names the original's id */
-    u32 cap = 16;
-    while (cap < p->nn * 2) cap <<= 1;
-    u32 *ids = r ? 0 : (u32 *)gz_alloc((size_t)cap * sizeof(u32));
-    if (!r && !ids) r = GZ_E_NOMEM;
-    for (u32 pass = 0; pass < 2 && !r; pass++) {
-        for (u32 i = 0; i < p->nn; i++) {
-            const xnode *d = &p->nd[i];
-            if (ent[i] < 0) continue;
-            u32 h;
-            if (!pass) {
-                if (!d->id) continue;
-                h = (d->id * 0x9E3779B1u) & (cap - 1);
-                while (ids[h] && p->nd[ids[h] - 1].id != d->id) h = (h + 1) & (cap - 1);
-                if (!ids[h]) ids[h] = i + 1;
-                continue;
-            }
-            if (d->type != FT_HARDLINK || !d->ref || (d->flags & NF_DATA)) continue;
-            h = (d->ref * 0x9E3779B1u) & (cap - 1);
-            while (ids[h] && p->nd[ids[h] - 1].id != d->ref) h = (h + 1) & (cap - 1);
-            if (!ids[h] || ids[h] - 1 == i || ent[ids[h] - 1] < 0) continue;
-            const xnode *o = &p->nd[ids[h] - 1];
-            gz_entry *e = &a->e[ent[i]];
-            if (a->e[ent[ids[h] - 1]].is_dir) continue;
-            e->is_link = 2;
-            e->link_off = o->path_off;
-            e->link_len = o->path_len;
+    /* hard links: <type link="N">hardlink</type> names the original's id (the first
+     * entry with that id). Ids come from the TOC: sorted, not hashed. */
+    u32 nid = 0;
+    for (u32 i = 0; !r && i < p->nn; i++) nid += ent[i] >= 0 && p->nd[i].id;
+    gz_keyidx *ids = r || !nid ? 0 : (gz_keyidx *)gz_alloc((size_t)nid * sizeof *ids);
+    if (!r && nid && !ids) r = GZ_E_NOMEM;
+    if (!r && nid) {
+        u32 k = 0;
+        for (u32 i = 0; i < p->nn; i++)
+            if (ent[i] >= 0 && p->nd[i].id) { ids[k].key = p->nd[i].id; ids[k].idx = i; k++; }
+        r = gz_keyidx_sort(ids, nid);
+    }
+    for (u32 i = 0; !r && nid && i < p->nn; i++) {
+        const xnode *d = &p->nd[i];
+        if (ent[i] < 0 || d->type != FT_HARDLINK || !d->ref || (d->flags & NF_DATA)) continue;
+        u32 lo = 0, hi = nid;
+        while (lo < hi) {
+            u32 mid = lo + (hi - lo) / 2;
+            if (ids[mid].key < d->ref) lo = mid + 1; else hi = mid;
         }
+        if (lo == nid || ids[lo].key != d->ref || ids[lo].idx == i) continue;
+        const xnode *o = &p->nd[ids[lo].idx];
+        if (a->e[ent[ids[lo].idx]].is_dir) continue;
+        gz_entry *e = &a->e[ent[i]];
+        e->is_link = 2;
+        e->link_off = o->path_off;
+        e->link_len = o->path_len;
     }
     gz_free(ids);
     gz_free(ent);
