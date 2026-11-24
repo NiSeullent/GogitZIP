@@ -28,24 +28,42 @@ def load(name):
     return m
 
 
+_MEASURE = """
+import os, subprocess, sys, threading
+p = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL)
+t = threading.Timer(float(sys.argv[1]), p.kill)
+t.start()
+_, st, ru = os.wait4(p.pid, 0)
+t.cancel()
+rc = os.WEXITSTATUS(st) if os.WIFEXITED(st) else -os.WTERMSIG(st)
+sys.stderr.write("\\nGZMEASURE %d %d\\n" % (rc, ru.ru_maxrss))
+"""
+
+
 def measured(cmd, timeout=120, cwd=None):
     """Run cmd: (exit code, stdout, stderr, peak RSS of that process in MiB, seconds)."""
     with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
         t0 = time.time()
-        p = subprocess.Popen(cmd, stdout=fo, stderr=fe, cwd=cwd)
-        timer = threading.Timer(timeout, p.kill)
-        timer.start()
+        # Linux carries the forking process's RSS high-water mark into the child's ru_maxrss,
+        # so a large test runner would be measured instead of gzt: fork from a small helper.
+        p = subprocess.Popen([sys.executable, "-I", "-S", "-c", _MEASURE, str(timeout)] + list(cmd),
+                             stdout=fo, stderr=fe, stdin=subprocess.PIPE, cwd=cwd)
         try:
-            _, status, ru = os.wait4(p.pid, 0)
-        finally:
-            timer.cancel()
+            p.communicate(timeout=timeout + 30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
         dt = time.time() - t0
-        rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
-        p.returncode = rc
         fo.seek(0)
         fe.seek(0)
-        rss = ru.ru_maxrss / (1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0)
-        return rc, fo.read().decode("utf-8", "replace"), fe.read().decode("utf-8", "replace"), rss, dt
+        err = fe.read().decode("utf-8", "replace")
+        rc, rss = -9, 1e9
+        tail = err.rstrip("\n").rsplit("\n", 1)
+        if tail and tail[-1].startswith("GZMEASURE "):
+            _, a, b = tail[-1].split()
+            rc, rss = int(a), int(b) / (1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0)
+            err = tail[0] + "\n" if len(tail) > 1 else ""
+        return rc, fo.read().decode("utf-8", "replace"), err, rss, dt
 
 
 def gzt_list(t, path, timeout=120):
