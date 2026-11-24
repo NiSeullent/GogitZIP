@@ -27,6 +27,14 @@ typedef struct gz_ctx gz_ctx;
 #define GZ_CP_AUTO 0
 #define GZ_CP_UTF8 65001
 
+/* Archives nested in archives are read through one view per level (gz_arc_open_child,
+ * automatic descent into disk images): at most this many levels. */
+#define GZ_MAX_LAYERS 64
+/* Decoded names keep at most this many components: a deeper name keeps its first
+ * GZ_NAME_MAX_DEPTH - 2 components and its last one, the components in between become
+ * one, joined with '_' (folder names cost depth x length in the tree). */
+#define GZ_NAME_MAX_DEPTH 1024
+
 enum { GZ_ENC_NONE = 0, GZ_ENC_ZIPCRYPTO = 1, GZ_ENC_AES = 2, GZ_ENC_OTHER = 3 };
 enum { GZ_MT_NONE = 0, GZ_MT_FILETIME = 1, GZ_MT_DOS = 2 };
 
@@ -102,7 +110,7 @@ struct gz_ctx {
     void (*slot_free[GZ_SLOT_COUNT])(void *);
     gz_archive *view_arc;         /* cached layer views (images/partitions)        */
     gz_src *view_raw;
-    gz_src *view_chain[8];
+    gz_src *view_chain[GZ_MAX_LAYERS];
     u32 view_n;
     u8 *buf; u32 buf_cap;         /* scratch buffer, see gz_ctx_buffer             */
     void (*progress)(void *user, u64 done, u64 total);   /* optional, open() only  */
@@ -216,7 +224,9 @@ struct gz_archive {
 
 /* Open: o may be NULL (defaults). c supplies the inflater/cancel for listing. */
 int  gz_arc_open(gz_archive **out, gz_src *src, const gz_open_opts *o, gz_ctx *c);
-/* Open entry idx of an archive as an archive of its own (random access only). */
+/* Open entry idx of an archive as an archive of its own (random access only).
+ * GZ_E_METHOD when it cannot be read in place (no view, or GZ_MAX_LAYERS levels deep):
+ * extract the entry and open the copy instead. */
 int  gz_arc_open_child(gz_archive **out, gz_archive *parent, gz_src *parent_src, u32 idx,
                        const gz_open_opts *o, gz_ctx *c);
 void gz_arc_close(gz_archive *a);

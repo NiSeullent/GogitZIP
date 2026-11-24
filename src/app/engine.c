@@ -1099,6 +1099,49 @@ static int make_room(gz_job *j, const gz_entry *e, gzch *path, gzch *tmp, const 
     return r && r != GZ_OSE_NOENT ? gz_os_err_gz(r, GZ_E_CREATE) : GZ_OK;
 }
 
+/* ---------------- extraction: downloaded-file mark ---------------- */
+
+/* The archive's mark (quarantine, Zone.Identifier) goes to every file the job writes
+ * and, where the system checks them too (GZ_OSC_MARK_ALL: macOS app bundles are
+ * folders), to every folder and link it creates. */
+static int mark_files(const gz_job *j)
+{
+    return j->h->mark_n && (j->caps & GZ_OSC_MARK) && !(j->flags & GZ_XF_NO_MARK);
+}
+
+static int mark_all(const gz_job *j) { return mark_files(j) && (j->caps & GZ_OSC_MARK_ALL); }
+
+static void mark_file(gz_job *j, gz_fd fd, const gzch *path)
+{
+    if (mark_files(j)) gz_os_mark_set(fd, path, j->h->mark, j->h->mark_n);
+}
+
+static void mark_item(gz_job *j, const gzch *path)     /* a folder or link just made */
+{
+    if (mark_all(j)) gz_os_mark_set(GZ_FD_NONE, path, j->h->mark, j->h->mark_n);
+}
+
+/* mkdir -p. With marks on folders, path is walked from index from on (what is above
+ * belongs to the user) and every folder made here gets the mark. */
+static int make_dirs(gz_job *j, gzch *path, size_t from)
+{
+    if (!mark_all(j)) return gz_os_mkdirs(path);
+    gz_os_info st;
+    if (!gz_os_stat(path, &st, 1) && st.type == GZ_FT_DIR) return GZ_OSE_OK;
+    size_t n = wlen(path);
+    for (size_t i = from ? from : 1; i <= n; i++) {
+        if (i < n && path[i] != SEP) continue;
+        gzch c = path[i];
+        path[i] = 0;
+        int e = gz_os_mkdir(path, 0777);
+        if (!e) mark_item(j, path);
+        else if (e == GZ_OSE_EXIST) e = gz_os_stat(path, &st, 1) || st.type != GZ_FT_DIR ? GZ_OSE_NOTDIR : GZ_OSE_OK;
+        path[i] = c;
+        if (e) return e;
+    }
+    return GZ_OSE_OK;
+}
+
 static int ensure_parent(worker *w, gzch *path)
 {
     gz_job *j = w->j;
@@ -1106,7 +1149,7 @@ static int ensure_parent(worker *w, gzch *path)
     if (s >= n || s <= j->dest_len) return GZ_OSE_OK;
     if (s == w->lastdir_len && !__builtin_memcmp(w->lastdir, path, s * sizeof(gzch))) return GZ_OSE_OK;
     path[s] = 0;
-    int e = gz_os_mkdirs(path);
+    int e = make_dirs(j, path, j->dest_len + 1);
     if (!e) { __builtin_memcpy(w->lastdir, path, s * sizeof(gzch)); w->lastdir_len = s; }
     path[s] = SEP;
     return e;
@@ -1171,7 +1214,7 @@ static int w_open(gz_out *o, u32 idx)
     if (sh) job_log(j, GZ_LOG_WARN, GZ_N_SHORTENED, e->name, w->s.path);
 
     if (e->is_dir) {
-        int r = gz_os_mkdirs(w->s.path);
+        int r = make_dirs(j, w->s.path, j->dest_len + 1);
         if (r) {
             job_log(j, GZ_LOG_ERROR, gz_os_err_gz(r, GZ_E_CREATE), e->name, w->s.path);
             return open_fail(w, e, GZ_E_CREATE);
@@ -1264,8 +1307,7 @@ static int w_close(gz_out *o, u32 idx, int st)
     flush_progress(w);
     if (w->mode == W_FILE && w->fd != GZ_FD_NONE) {
         if (st == GZ_OK) {
-            if (j->h->mark_n && (j->caps & GZ_OSC_MARK) && !(j->flags & GZ_XF_NO_MARK))
-                gz_os_mark_set(w->fd, w->s.path, j->h->mark, j->h->mark_n);
+            mark_file(j, w->fd, w->s.path);
             int apply;
             u32 m = entry_mode(j, e, &apply);
             if (apply && m != (0666u & ~j->umask)) gz_os_fset_mode(w->fd, m);   /* else as created */
@@ -1456,6 +1498,7 @@ static int copy_file(gz_job *j, const gzch *from, const gzch *to)
         if (cancelled(j)) r = GZ_E_CANCEL;
     }
     gz_os_info st;
+    if (!r) mark_file(j, out, to);
     if (!r && !gz_os_fstat(in, &st)) {
         if (j->caps & GZ_OSC_MODES) gz_os_fset_mode(out, st.mode & 07777);
         gz_os_fset_times(out, st.mtime, 0);
@@ -1497,13 +1540,13 @@ static void links_phase(gz_job *j, scratch *s)
         if (sh) job_log(j, GZ_LOG_WARN, GZ_N_SHORTENED, e->name, s->path);
         if (parent_has_link(j, s->path)) { job_log(j, GZ_LOG_WARN, GZ_N_LINK_THROUGH, e->name, L->target); continue; }
         int hard = e->is_link == 2;
+        gz_os_info ts = { 0 };
         if (hard) {
             gzch *tn = wdup(L->target);
             if (!tn) { job_log(j, GZ_LOG_ERROR, GZ_E_NOMEM, e->name, 0); continue; }
             sanitize_rel(tn);
             int tb = build_out_path(j, tn, 0, s->tpath, PCAP, 0);
             gz_free(tn);
-            gz_os_info ts;
             if (tb <= 0 || gz_os_stat(s->tpath, &ts, 0) || (ts.type != GZ_FT_FILE && ts.type != GZ_FT_LINK)) {
                 job_log(j, GZ_LOG_WARN, GZ_N_LINK_TARGET, e->name, L->target);
                 continue;
@@ -1536,12 +1579,16 @@ static void links_phase(gz_job *j, scratch *s)
         size_t pn = wlen(s->path), ps = last_sep(s->path, pn);
         if (ps < pn && ps > j->dest_len) {
             s->path[ps] = 0;
-            int me = gz_os_mkdirs(s->path);
+            int me = make_dirs(j, s->path, j->dest_len + 1);
             s->path[ps] = SEP;
             if (me) { job_log(j, GZ_LOG_ERROR, gz_os_err_gz(me, GZ_E_CREATE), e->name, s->path); continue; }
         }
         gz_os_info st;
         if (!gz_os_stat(s->path, &st, 0)) {
+            /* the link's own target under another name: a file system that ignores case
+             * or normalisation ("a.txt" -> "A.txt"), or linked already. Replacing it
+             * would delete the target. */
+            if (hard && st.ino && st.dev == ts.dev && st.ino == ts.ino) continue;
             int r = make_room(j, e, s->path, s->tmp, &st);
             if (r == GZ_E_CANCEL) break;
             if (r == GZ_E_SKIP) { add_progress(j, 0, 0, 1); continue; }
@@ -1556,6 +1603,7 @@ static void links_phase(gz_job *j, scratch *s)
         }
         if (r) { job_log(j, GZ_LOG_ERROR, GZ_E_CREATE, e->name, L->target); continue; }
         if (!hard) {
+            mark_item(j, s->path);
             u64 t = (j->flags & GZ_XF_NO_TIMES) ? 0 : gz_entry_time(e);
             if (t) gz_os_set_times(s->path, t, 0, 0);
             made[nmade].path = wdup(s->path);
@@ -1635,7 +1683,7 @@ static int extract_main(void *arg)
     scratch *s = (scratch *)gz_alloc(sizeof(scratch));
     if (!s) { job_log(j, GZ_LOG_ERROR, GZ_E_NOMEM, j->h->name, 0); job_finish(j, GZ_E_NOMEM); return 0; }
     if (!j->test) {
-        int e = gz_os_mkdirs(j->dest);
+        int e = make_dirs(j, j->dest, 1);
         if (e) {
             job_log(j, GZ_LOG_ERROR, gz_os_err_gz(e, GZ_E_CREATE), j->dest, 0);
             gz_free(s);
@@ -2163,6 +2211,7 @@ static int compress_main(void *arg)
     gzch *prefix = 0;
     gz_fd fd = GZ_FD_NONE;
     int r = GZ_OK, made_tmp = 0;
+    u32 out_mode = 0666u & ~gz_os_umask();          /* a new archive: like any new file */
     fsink k;
     __builtin_memset(&k, 0, sizeof k);
     if (!w || !tmp) { r = GZ_E_NOMEM; job_log(j, GZ_LOG_ERROR, r, j->c_out, 0); goto out; }
@@ -2208,6 +2257,7 @@ static int compress_main(void *arg)
         if (mode != GZ_OW_ALL) { r = GZ_E_CREATE; job_log(j, GZ_LOG_ERROR, GZ_N_EXISTS, j->c_out, 0); goto out; }
         w->skip_dev[w->nskip] = ost.dev;
         w->skip_ino[w->nskip++] = ost.ino;
+        if (ost.type == GZ_FT_FILE) out_mode = ost.mode & 0777;     /* a replaced archive keeps its mode */
     }
 
     /* temporary output next to the archive */
@@ -2286,6 +2336,8 @@ static int compress_main(void *arg)
     }
 out:
     if (fd != GZ_FD_NONE) {
+        /* the temporary file was created private (0600); best effort (FAT has no modes) */
+        if (!r && (gz_os_caps() & GZ_OSC_MODES)) gz_os_fset_mode(fd, out_mode);
         int ce = gz_os_close(fd);
         if (!r && ce) { r = gz_os_err_gz(ce, GZ_E_IO); job_log(j, GZ_LOG_ERROR, r, j->c_out, 0); }
     }
